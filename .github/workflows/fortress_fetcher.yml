@@ -1,0 +1,51 @@
+name: Fortress Sniper — NSE Fetcher
+
+on:
+  # Runs at 19:00 IST (13:30 UTC) Mon–Fri — after NSE archive files are published.
+  # Previously 16:00 IST which was too early; bhavcopy ZIPs land ~18:00–19:00 IST.
+  schedule:
+    - cron: "30 13 * * 1-5"
+
+  # Manual trigger from trigger.html or GitHub UI
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Trigger reason"
+        required: false
+        default: "Manual run"
+
+jobs:
+  fetch-nse-data:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests pandas gspread google-auth
+
+      - name: Run Fortress Fetcher
+        env:
+          GOOGLE_CREDS_JSON:   ${{ secrets.GOOGLE_CREDS_JSON }}
+          GOOGLE_SHEET_ID:     ${{ secrets.GOOGLE_SHEET_ID }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python fortress_fetcher.py
+
+      - name: Notify on workflow failure (Telegram)
+        if: failure()
+        run: |
+          TEXT="❌ Fortress Sniper — GitHub Actions FAILED%0ARun: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s --data-urlencode "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+               --data-urlencode "text=${TEXT}" \
+               --data-urlencode "parse_mode=HTML" \
+               "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage"
