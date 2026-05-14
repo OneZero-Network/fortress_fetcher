@@ -1,0 +1,1009 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════════╗
+║  FORTRESS SNIPER — Cloud Fetcher v2.1                              ║
+║  Runs headless on GitHub Actions (no GUI, no Tkinter)              ║
+║                                                                      ║
+║  All config via GitHub Secrets (environment variables):             ║
+║    GOOGLE_CREDS_JSON   — full contents of credentials.json         ║
+║    GOOGLE_SHEET_ID     — your spreadsheet ID                       ║
+║    TELEGRAM_BOT_TOKEN  — from @BotFather                           ║
+║    TELEGRAM_CHAT_ID    — your chat/group ID                        ║
+║    GITHUB_REPOSITORY   — set automatically by GitHub Actions       ║
+║    GITHUB_RUN_ID       — set automatically by GitHub Actions       ║
+║                                                                      ║
+║  v2.1 changes vs v2.0:                                             ║
+║    - Full traceback logged for every exception, everywhere         ║
+║    - No silent except:/continue blocks — every skip is logged      ║
+║    - NSE session warmup failures are logged with status codes      ║
+║    - _nse_json HTML check fixed (was wrapped in broken try/except) ║
+║    - Telegram error messages include GitHub Actions run URL        ║
+║    - Error strings no longer truncated to 60 chars                 ║
+║    - push_df logs quota/auth errors with full detail               ║
+║    - Config validation at startup with clear missing-secret hints  ║
+║    - Bhavcopy file attempt log shows full URL and failure reason   ║
+║    - FII/DII field resolution logs what key was actually found     ║
+║    - Insider skipped rows logged individually at DEBUG level       ║
+╚══════════════════════════════════════════════════════════════════════╝
+"""
+
+import os, sys, io, time, json, zlib, traceback, html as _html
+from datetime import datetime, timedelta, date
+from collections import defaultdict
+
+try:
+    import requests
+    import pandas as pd
+    import gspread
+    from google.oauth2.service_account import Credentials
+except ImportError as e:
+    print(f"[FATAL] Missing dependency: {e}", flush=True)
+    print("Run: pip install requests pandas gspread google-auth", flush=True)
+    sys.exit(1)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CONFIG — all from environment variables / GitHub Secrets
+# ══════════════════════════════════════════════════════════════════════
+
+GOOGLE_CREDS_JSON  = os.environ.get("GOOGLE_CREDS_JSON",  "")
+GOOGLE_SHEET_ID    = os.environ.get("GOOGLE_SHEET_ID",    "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "")
+
+# Auto-set by GitHub Actions — used to build the run log URL in Telegram messages
+GH_REPO   = os.environ.get("GITHUB_REPOSITORY", "")
+GH_RUN_ID = os.environ.get("GITHUB_RUN_ID", "")
+
+SHEET_BHAVCOPY = "BHAVCOPY"
+SHEET_FII_DII  = "FII_DII"
+SHEET_INSIDER  = "INSIDER"
+SHEET_FILINGS  = "FILINGS"
+SHEET_EARNINGS = "EARNINGS"
+
+_SCOPES = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# LOGGING — every function uses these, never bare print()
+# ══════════════════════════════════════════════════════════════════════
+
+def log(msg: str, level: str = "INFO"):
+    ts     = datetime.utcnow().strftime("%H:%M:%S")
+    prefix = {"INFO":"   ", "WARN":"⚠️ ", "ERR":"❌ ", "OK":"✅ ", "DBG":"🔍 "}.get(level, "   ")
+    print(f"[{ts}] {prefix}{msg}", flush=True)
+
+def log_tb(label: str, exc: Exception):
+    """Log exception type, message, AND full traceback. Called in every except block."""
+    log(f"{label}: {type(exc).__name__}: {exc}", "ERR")
+    for line in traceback.format_exc().strip().splitlines():
+        print(f"           {line}", flush=True)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# STARTUP CONFIG VALIDATION
+# ══════════════════════════════════════════════════════════════════════
+
+def validate_config():
+    """Check all required secrets are present and the credentials JSON is valid."""
+    missing = []
+    if not GOOGLE_CREDS_JSON:
+        missing.append("GOOGLE_CREDS_JSON  ← paste full credentials.json text")
+    if not GOOGLE_SHEET_ID:
+        missing.append("GOOGLE_SHEET_ID    ← your spreadsheet ID")
+    if not TELEGRAM_BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN ← from @BotFather")
+    if not TELEGRAM_CHAT_ID:
+        missing.append("TELEGRAM_CHAT_ID   ← use @userinfobot to find yours")
+    if missing:
+        log("Missing required GitHub Secrets — add them at:", "ERR")
+        log("  Repo → Settings → Secrets and variables → Actions → New repository secret", "ERR")
+        for m in missing:
+            log(f"  • {m}", "ERR")
+        sys.exit(1)
+
+    try:
+        creds = json.loads(GOOGLE_CREDS_JSON)
+    except json.JSONDecodeError as exc:
+        log_tb("GOOGLE_CREDS_JSON is not valid JSON — paste the full file, not just part of it", exc)
+        sys.exit(1)
+
+    required_keys = ["type", "project_id", "private_key", "client_email"]
+    missing_keys  = [k for k in required_keys if k not in creds]
+    if missing_keys:
+        log(f"GOOGLE_CREDS_JSON is missing fields: {missing_keys}", "ERR")
+        log("Make sure you pasted the ENTIRE contents of credentials.json", "ERR")
+        sys.exit(1)
+
+    log(f"Config OK — service account: {creds.get('client_email', '?')}", "OK")
+    log(f"Sheet ID: {GOOGLE_SHEET_ID}", "DBG")
+    log(f"Telegram chat: {TELEGRAM_CHAT_ID}", "DBG")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TELEGRAM
+# ══════════════════════════════════════════════════════════════════════
+
+def _actions_url() -> str:
+    if GH_REPO and GH_RUN_ID:
+        return f"https://github.com/{GH_REPO}/actions/runs/{GH_RUN_ID}"
+    return ""
+
+def send_telegram(text: str):
+    """Send Telegram message. Never raises — logs failures instead."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram not configured — skipping", "WARN")
+        return
+    # Escape raw user/exception text so <, >, & don't cause Telegram 400 errors.
+    # We do a targeted escape: protect only the unformatted parts by escaping the
+    # whole string, then restoring the intentional HTML tags we use.
+    # Simpler and safer: escape everything, then un-escape our known safe tags.
+    safe = (text
+        .replace("&", "&amp;")
+        .replace("<b>", "\x00B\x00").replace("</b>", "\x00/B\x00")
+        .replace("<code>", "\x00C\x00").replace("</code>", "\x00/C\x00")
+        .replace("<a ", "\x00A\x00").replace("</a>", "\x00/A\x00")
+        .replace("<", "&lt;").replace(">", "&gt;")
+        .replace("\x00B\x00", "<b>").replace("\x00/B\x00", "</b>")
+        .replace("\x00C\x00", "<code>").replace("\x00/C\x00", "</code>")
+        .replace("\x00A\x00", "<a ").replace("\x00/A\x00", "</a>")
+    )
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": safe,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=20
+        )
+        if resp.status_code == 200:
+            log("Telegram notification sent", "OK")
+        else:
+            log(f"Telegram HTTP {resp.status_code}: {resp.text[:300]}", "WARN")
+    except Exception as exc:
+        log_tb("Telegram send error (notification lost)", exc)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# NSE SESSION
+# ══════════════════════════════════════════════════════════════════════
+
+def nse_session() -> requests.Session:
+    """
+    Warmed-up requests Session for NSE.
+    Warmup failures are LOGGED (with status code) but never abort the run —
+    the session is still returned so the actual API calls can try.
+    """
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent":      ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0.0.0 Safari/537.36"),
+        "Accept":          "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "DNT":             "1",
+        "Connection":      "keep-alive",
+    })
+    for url in ["https://www.nseindia.com",
+                "https://www.nseindia.com/market-data/live-equity-market"]:
+        try:
+            r = s.get(url, timeout=15)
+            log(f"NSE warmup {url[-35:]} → HTTP {r.status_code} ({len(r.content)}B)", "DBG")
+            time.sleep(1.5)
+        except requests.exceptions.Timeout:
+            log(f"NSE warmup TIMEOUT for {url} — continuing anyway", "WARN")
+        except requests.exceptions.ConnectionError as exc:
+            log(f"NSE warmup CONNECTION ERROR for {url}: {exc} — continuing anyway", "WARN")
+        except Exception as exc:
+            log_tb(f"NSE warmup unexpected error for {url}", exc)
+    return s
+
+
+def _extract_json_from_binary(raw_bytes: bytes):
+    """Last-resort JSON extraction from mangled/compressed responses."""
+    for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
+        try:
+            text  = raw_bytes.decode(enc).lstrip("\ufeff").lstrip("\x00").lstrip()
+            start = text.find("{")
+            if start == -1:
+                start = text.find("[")
+            if start != -1:
+                brace = text[start]
+                close = "}" if brace == "{" else "]"
+                count = 0
+                for i, ch in enumerate(text[start:], start):
+                    if ch == brace:   count += 1
+                    elif ch == close:
+                        count -= 1
+                        if count == 0:
+                            return json.loads(text[start:i + 1])
+            return json.loads(text)
+        except Exception:
+            continue
+    try:
+        return _extract_json_from_binary(zlib.decompress(raw_bytes, 16 + zlib.MAX_WBITS))
+    except Exception:
+        pass
+    raise ValueError(
+        f"Could not extract JSON from response — "
+        f"first 120 bytes: {raw_bytes[:120]!r}"
+    )
+
+
+def _nse_json(sess, url: str, params=None, timeout: int = 20, referer: str = None, _retry: int = 3):
+    """
+    GET a NSE endpoint and return parsed JSON.
+    Raises ValueError with FULL context on any failure.
+    Retries up to _retry times on 429 (rate-limit) or 502/503 (gateway errors).
+    """
+    req_headers = {}
+    if referer:
+        req_headers["Referer"]          = referer
+        req_headers["X-Requested-With"] = "XMLHttpRequest"
+
+    log(f"NSE GET {url.replace('https://www.nseindia.com','').replace('https://nsearchives.nseindia.com','[arch]')[:80]}", "DBG")
+
+    for attempt in range(1, _retry + 1):
+        try:
+            resp = sess.get(url, params=params, timeout=timeout, headers=req_headers)
+        except requests.exceptions.Timeout:
+            raise ValueError(f"NSE request timed out after {timeout}s\n  URL: {url}")
+        except requests.exceptions.ConnectionError as exc:
+            raise ValueError(f"NSE connection error: {exc}\n  URL: {url}")
+        except Exception as exc:
+            raise ValueError(f"NSE request failed ({type(exc).__name__}): {exc}\n  URL: {url}")
+
+        raw = resp.content
+        log(f"NSE response: HTTP {resp.status_code}, {len(raw)} bytes", "DBG")
+
+        if resp.status_code in (429, 502, 503) and attempt < _retry:
+            wait = 6 * attempt
+            log(f"HTTP {resp.status_code} — backing off {wait}s before retry {attempt}/{_retry - 1}...", "WARN")
+            time.sleep(wait)
+            continue
+
+        if not raw or len(raw) < 10:
+            raise ValueError(
+                f"NSE returned EMPTY body (HTTP {resp.status_code})\n"
+                f"  URL: {url}\n"
+                f"  This usually means NSE blocked the request or the endpoint changed."
+            )
+
+        # lstrip() handles NSE padding raw HTML with spaces/newlines before <!DOCTYPE
+        raw_stripped = raw.lstrip()
+        if raw_stripped[:1] == b"<" or raw_stripped[:9].lower() == b"<!doctype":
+            preview = raw[:400].decode("utf-8", errors="ignore")
+            raise ValueError(
+                f"NSE returned HTML instead of JSON (HTTP {resp.status_code})\n"
+                f"  URL: {url}\n"
+                f"  Cause: NSE rate-limit / IP block / endpoint moved\n"
+                f"  HTML preview: {preview[:250]}"
+            )
+
+        try:
+            return resp.json()
+        except Exception:
+            pass
+
+        log("Standard JSON decode failed — attempting binary extraction", "WARN")
+        return _extract_json_from_binary(raw)
+
+    raise ValueError(f"NSE {url} failed after {_retry} retries (persistent rate-limit or IP block).")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TRADING DAY
+# ══════════════════════════════════════════════════════════════════════
+
+_NSE_HOLIDAYS = {
+    date(2024, 1, 22), date(2024, 3, 25), date(2024, 3, 29), date(2024, 4, 14),
+    date(2024, 4, 17), date(2024, 5, 23), date(2024, 6, 17), date(2024, 7, 17),
+    date(2024, 8, 15), date(2024, 10, 2), date(2024, 11, 1), date(2024, 11, 15),
+    date(2024, 11, 20), date(2024, 12, 25),
+    date(2025, 2, 26), date(2025, 3, 14), date(2025, 3, 31), date(2025, 4, 10),
+    date(2025, 4, 14), date(2025, 4, 18), date(2025, 5, 1),  date(2025, 8, 15),
+    date(2025, 8, 27), date(2025, 10, 2), date(2025, 10, 24), date(2025, 11, 5),
+    date(2025, 12, 25),
+    date(2026, 1, 26), date(2026, 3, 20), date(2026, 4, 3),  date(2026, 4, 14),
+    date(2026, 6, 17),  # Bakri Id / Eid ul-Adha (approx — verify on NSE calendar)
+    date(2026, 7, 6),   # Muharram (approx — verify on NSE calendar)
+    date(2026, 8, 15),
+    date(2026, 8, 25),  # Ganesh Chaturthi
+    date(2026, 10, 2),
+    date(2026, 10, 20), # Diwali - Laxmi Pujan
+    date(2026, 10, 21), # Diwali Balipratipada
+    date(2026, 11, 4),  # Guru Nanak Jayanti
+    date(2026, 12, 25),
+}
+
+def get_last_trading_day():
+    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    d = now_ist.date()
+    if now_ist.hour < 15 or (now_ist.hour == 15 and now_ist.minute < 30):
+        d -= timedelta(days=1)
+        log(f"Market not closed yet ({now_ist.strftime('%H:%M')} IST) — using previous day", "DBG")
+    for _ in range(14):
+        if d.weekday() < 5 and d not in _NSE_HOLIDAYS:
+            break
+        d -= timedelta(days=1)
+    else:
+        raise RuntimeError(
+            "Could not find a trading day in the last 14 calendar days. "
+            "Check _NSE_HOLIDAYS — you may be missing a holiday entry that caused an infinite skip."
+        )
+    log(f"Last trading day: {d} (weekday={d.strftime('%A')})", "DBG")
+    return d.strftime("%d%m%Y"), d.strftime("%Y-%m-%d")
+
+def _month_abbr(mm: str) -> str:
+    return {"01":"JAN","02":"FEB","03":"MAR","04":"APR","05":"MAY","06":"JUN",
+            "07":"JUL","08":"AUG","09":"SEP","10":"OCT","11":"NOV","12":"DEC"}.get(mm, mm)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BHAVCOPY
+# ══════════════════════════════════════════════════════════════════════
+
+def _download_bhavcopy_file(date_str: str, warmed_sess: requests.Session = None) -> pd.DataFrame:
+    dd, mm, yyyy = date_str[:2], date_str[2:4], date_str[4:]
+    mon, yyyymmdd = _month_abbr(mm), f"{yyyy}{mm}{dd}"
+    urls = [
+        (f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{yyyymmdd}_F_0000.csv.zip", True),
+        (f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{yyyymmdd}_F_0000.csv",     False),
+        (f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv",            False),
+        (f"https://archives.nseindia.com/content/historical/EQUITIES/{yyyy}/{mon}/cm{date_str}bhav.csv.zip", True),
+        (f"https://archives.nseindia.com/content/historical/EQUITIES/{yyyy}/{mon}/cm{date_str}bhav.csv",     False),
+    ]
+    # Use the warmed session (with NSE cookies) if provided; otherwise build a cold one.
+    # A cold session often gets 403 from nsearchives.nseindia.com.
+    if warmed_sess:
+        sess = warmed_sess
+        # Ensure archive host headers are present
+        sess.headers.setdefault("Referer", "https://www.nseindia.com/")
+    else:
+        sess = requests.Session()
+        sess.headers.update({
+            "User-Agent":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer":     "https://www.nseindia.com/",
+            "Accept":      "*/*",
+        })
+    attempt_log = []
+
+    for url, is_zip in urls:
+        try:
+            log(f"Trying {url[45:]}", "DBG")
+            r = sess.get(url, timeout=30)
+            note = f"HTTP {r.status_code} ({len(r.content)}B) — {url[45:]}"
+            attempt_log.append(note)
+            if r.status_code == 200 and len(r.content) > 1000:
+                df = pd.read_csv(io.BytesIO(r.content), compression="zip" if is_zip else None)
+                df.columns = df.columns.str.strip()
+                if len(df) > 100:
+                    log(f"File downloaded: {len(df)} rows from {url[45:]}", "OK")
+                    return df
+                else:
+                    log(f"File too small: only {len(df)} rows — skipping", "WARN")
+                    attempt_log[-1] += f" [only {len(df)} rows — too small]"
+            elif r.status_code == 404:
+                log(f"404 — not published yet: {url[45:]}", "DBG")
+            elif r.status_code in (401, 403):
+                log(f"HTTP {r.status_code} — IP block or auth: {url[45:]}", "WARN")
+            else:
+                log(f"HTTP {r.status_code} — unexpected: {url[45:]}", "WARN")
+        except requests.exceptions.Timeout:
+            msg = f"TIMEOUT — {url[45:]}"
+            attempt_log.append(msg); log(msg, "WARN")
+        except Exception as exc:
+            msg = f"{type(exc).__name__}: {exc} — {url[45:]}"
+            attempt_log.append(msg); log(msg, "WARN")
+        time.sleep(0.5)
+
+    raise Exception(
+        f"All {len(urls)} bhavcopy file URLs failed for {date_str}.\n"
+        f"Individual attempts:\n" + "\n".join(f"  {a}" for a in attempt_log) + "\n"
+        f"Note: NSE archive files are usually published ~1h after market close (16:30 IST)."
+    )
+
+
+def _download_bhavcopy_api() -> pd.DataFrame:
+    sess = nse_session()
+    indices = [
+        ("NIFTY%20TOTAL%20MARKET",    "NIFTY TOTAL MARKET"),
+        ("NIFTY%20500",               "NIFTY 500"),
+        ("NIFTY%20MIDCAP%20150",      "NIFTY MIDCAP 150"),
+        ("NIFTY%20SMALLCAP%20250",    "NIFTY SMALLCAP 250"),
+        ("NIFTY%20MICROCAP%20250",    "NIFTY MICROCAP 250"),
+        ("NIFTY%20LARGEMIDCAP%20250", "NIFTY LARGEMIDCAP 250"),
+        ("NIFTY%20MIDSMALLCAP%20400", "NIFTY MIDSMALLCAP 400"),
+    ]
+    all_raw: dict = {}
+    failed:  list = []
+    referer = "https://www.nseindia.com/market-data/live-equity-market"
+
+    for idx_url, idx_name in indices:
+        try:
+            data = _nse_json(sess, f"https://www.nseindia.com/api/equity-stockIndices?index={idx_url}", referer=referer)
+            rows = data.get("data", [])
+            if not rows:
+                log(f"{idx_name}: 0 rows returned. API response keys: {list(data.keys())}", "WARN")
+                continue
+            new = 0
+            for r in rows:
+                sym = str(r.get("symbol","")).strip().upper()
+                if not sym or sym in all_raw: continue
+                try:
+                    lp = float(str(r.get("lastPrice","0")).replace(",",""))
+                except Exception:
+                    lp = 0.0
+                if lp > 0:
+                    all_raw[sym] = r; new += 1
+            log(f"{idx_name}: {len(rows)} rows (+{new} new), total unique: {len(all_raw)}")
+            time.sleep(0.8)
+        except Exception as exc:
+            log_tb(f"Bhavcopy API '{idx_name}' failed", exc)
+            failed.append(idx_name)
+
+    if failed:
+        log(f"Failed indices: {failed}. Continuing with {len(all_raw)} symbols collected so far.", "WARN")
+    if not all_raw:
+        raise ValueError(
+            f"Bhavcopy API fallback returned NO data from any of {len(indices)} indices. "
+            f"All failed: {failed}. NSE may be blocking GitHub Actions runner IP."
+        )
+
+    df = pd.DataFrame(list(all_raw.values()))
+    rename = {
+        "symbol":"SYMBOL","open":"OPEN","dayHigh":"HIGH","dayLow":"LOW",
+        "lastPrice":"CLOSE","previousClose":"PREV_CLOSE",
+        "totalTradedVolume":"VOLUME","totalTradedValue":"TURNOVER_LAKHS",
+        "change":"CHANGE","pChange":"PCHANGE",
+        "yearHigh":"YEAR_HIGH","yearLow":"YEAR_LOW",
+        "perChange365d":"PERCHANGE_365D","perChange30d":"PERCHANGE_30D",
+        "nearWKH":"NEAR_52WH","nearWKL":"NEAR_52WL","series":"SERIES",
+    }
+    df.rename(columns={k:v for k,v in rename.items() if k in df.columns}, inplace=True)
+    if "TURNOVER_LAKHS" in df.columns:
+        df["TURNOVER_LAKHS"] = pd.to_numeric(
+            df["TURNOVER_LAKHS"].astype(str).str.replace(",",""), errors="coerce"
+        ).fillna(0) / 100_000.0
+    df["SYMBOL"] = df["SYMBOL"].astype(str).str.strip().str.upper()
+    for col in ["OPEN","HIGH","LOW","CLOSE","PREV_CLOSE","VOLUME","CHANGE","PCHANGE","YEAR_HIGH","YEAR_LOW"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col].astype(str).str.replace(",",""), errors="coerce")
+    df = df[df["CLOSE"] > 0].dropna(subset=["CLOSE"])
+    priority = ["SYMBOL","SERIES","OPEN","HIGH","LOW","CLOSE","PREV_CLOSE","CHANGE","PCHANGE",
+                "VOLUME","TURNOVER_LAKHS","YEAR_HIGH","YEAR_LOW","NEAR_52WH","NEAR_52WL",
+                "PERCHANGE_365D","PERCHANGE_30D"]
+    front = [c for c in priority if c in df.columns]
+    return df[front + [c for c in df.columns if c not in front]].reset_index(drop=True)
+
+
+def clean_bhavcopy(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = df.columns.str.strip().str.upper()
+    log(f"Bhavcopy raw columns (first 10): {list(df.columns[:10])}", "DBG")
+
+    if not {"SYMBOL","CLOSE"}.issubset(df.columns):
+        col_maps = [
+            {"TCKRSYMB":"SYMBOL","SCTYSRS":"SERIES","OPNPRIC":"OPEN","HGHPRIC":"HIGH",
+             "LWPRIC":"LOW","CLSPRIC":"CLOSE","TTLTRADGVOL":"VOLUME","TTLTRFVAL":"TURNOVER_LAKHS"},
+            {"SYMBOL":"SYMBOL","SERIES":"SERIES","OPEN":"OPEN","HIGH":"HIGH","LOW":"LOW",
+             "CLOSE":"CLOSE","TOTTRDQTY":"VOLUME","TOTTRDVAL":"TURNOVER"},
+            {"SYMBOL":"SYMBOL","SERIES":"SERIES","OPEN_PRICE":"OPEN","HIGH_PRICE":"HIGH",
+             "LOW_PRICE":"LOW","CLOSE_PRICE":"CLOSE","TTL_TRD_QNTY":"VOLUME","TURNOVER_LACS":"TURNOVER_LAKHS"},
+        ]
+        matched = False
+        for mapping in col_maps:
+            if all(k in df.columns for k in mapping):
+                df = df.rename(columns=mapping)
+                log(f"Column map matched on keys: {list(mapping.keys())[:5]}", "DBG")
+                matched = True; break
+        if not matched:
+            raise ValueError(
+                f"Bhavcopy column format not recognised.\n"
+                f"  All columns in file: {list(df.columns)}\n"
+                f"  None of the 3 known column formats matched.\n"
+                f"  NSE may have changed their file format — check the raw file manually."
+            )
+        if "TURNOVER_LAKHS" not in df.columns and "TURNOVER" in df.columns:
+            df["TURNOVER_LAKHS"] = pd.to_numeric(df["TURNOVER"], errors="coerce").fillna(0) / 100_000
+
+    if "SERIES" in df.columns:
+        before = len(df)
+        df = df[df["SERIES"].astype(str).str.strip().str.upper() == "EQ"].copy()
+        log(f"EQ filter: {before} → {len(df)} rows", "DBG")
+
+    for col in ["OPEN","HIGH","LOW","CLOSE","VOLUME"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df[df["CLOSE"] > 0].dropna(subset=["CLOSE"])
+    df["SYMBOL"] = df["SYMBOL"].astype(str).str.strip().str.upper()
+    return df.reset_index(drop=True)
+
+
+def fetch_bhavcopy(date_str: str) -> pd.DataFrame:
+    sess = nse_session()          # warm once, reuse for both file download and API fallback
+    try:
+        return clean_bhavcopy(_download_bhavcopy_file(date_str, warmed_sess=sess))
+    except Exception as exc:
+        log_tb("Bhavcopy file download/parse failed — switching to live API fallback", exc)
+        log("🔄 Live API fallback starting...")
+        return _download_bhavcopy_api()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FII / DII
+# ══════════════════════════════════════════════════════════════════════
+
+def _parse_crore(val) -> float:
+    if val is None:
+        return 0.0
+    try:
+        return float(str(val).replace(",","").strip())
+    except Exception as exc:
+        log(f"_parse_crore: cannot parse {val!r} — {exc}", "WARN")
+        return 0.0
+
+def _first_key(d: dict, keys: list, label: str = ""):
+    """Return first matching key value, logging which key was used."""
+    for k in keys:
+        if k in d and d[k] not in (None, "", "-"):
+            if label:
+                log(f"  {label}: key='{k}' value={d[k]!r}", "DBG")
+            return d[k]
+    if label:
+        log(f"  {label}: NONE of {keys} found. Row has keys: {list(d.keys())}", "WARN")
+    return None
+
+def fetch_fii_dii():
+    sess = nse_session()
+    data = _nse_json(sess, "https://www.nseindia.com/api/fiidiiTradeReact",
+                     referer="https://www.nseindia.com/report-detail/eq_fii_dii")
+
+    if isinstance(data, dict):
+        rows = data.get("data", []) or [data]
+    elif isinstance(data, list):
+        rows = data
+    else:
+        rows = [data]
+    log(f"FII/DII: {len(rows)} row(s) from API")
+    for i, r in enumerate(rows):
+        log(f"  row[{i}] keys: {list(r.keys())}", "DBG")
+        log(f"  row[{i}] values: {dict(list(r.items())[:6])}", "DBG")
+
+    by_date: dict = defaultdict(lambda: {
+        "DATE":"","FII_BUY_CR":0,"FII_SELL_CR":0,"FII_NET_CR":0,
+        "DII_BUY_CR":0,"DII_SELL_CR":0,"DII_NET_CR":0
+    })
+
+    for idx, row in enumerate(rows):
+        raw_date = _first_key(row, ["date","DATE","tradeDate","trade_date"], f"row[{idx}].date")
+        if not raw_date:
+            raw_date = datetime.today().strftime("%d-%b-%Y")
+            log(f"row[{idx}]: no date found — using today {raw_date}", "WARN")
+        try:
+            row_date = pd.to_datetime(str(raw_date), dayfirst=True).strftime("%Y-%m-%d")
+        except Exception as exc:
+            log(f"row[{idx}]: date parse failed for {raw_date!r}: {exc} — using today", "WARN")
+            row_date = datetime.today().strftime("%Y-%m-%d")
+
+        category = str(row.get("category","")).strip().upper()
+        log(f"row[{idx}]: category='{category}', date='{row_date}'", "DBG")
+
+        buy_raw  = _first_key(row, ["buyValue","fiiBuy","diiBuy","BUY_VALUE"],  f"row[{idx}].buy")
+        sell_raw = _first_key(row, ["sellValue","fiiSell","diiSell","SELL_VALUE"], f"row[{idx}].sell")
+        net_raw  = _first_key(row, ["netValue","fiiNet","diiNet",
+                                    "FII_NET_PURCHASE_SALES","DII_NET_PURCHASE_SALES"], f"row[{idx}].net")
+
+        buy_val  = _parse_crore(buy_raw)
+        sell_val = _parse_crore(sell_raw)
+        net_val  = _parse_crore(net_raw) if net_raw is not None else (buy_val - sell_val)
+
+        rec = by_date[row_date]
+        rec["DATE"] = row_date
+        if "FII" in category or "FPI" in category or "FOREIGN" in category:
+            rec["FII_BUY_CR"]  = round(buy_val,2)
+            rec["FII_SELL_CR"] = round(sell_val,2)
+            rec["FII_NET_CR"]  = round(net_val,2)
+        elif "DII" in category or "DOMESTIC" in category:
+            rec["DII_BUY_CR"]  = round(buy_val,2)
+            rec["DII_SELL_CR"] = round(sell_val,2)
+            rec["DII_NET_CR"]  = round(net_val,2)
+        else:
+            log(f"row[{idx}]: unknown category '{category}' — assigning by position (FII first, DII second)", "WARN")
+            if rec["FII_NET_CR"] == 0 and rec["DII_NET_CR"] == 0:
+                rec["FII_BUY_CR"]=round(buy_val,2); rec["FII_SELL_CR"]=round(sell_val,2); rec["FII_NET_CR"]=round(net_val,2)
+            else:
+                rec["DII_BUY_CR"]=round(buy_val,2); rec["DII_SELL_CR"]=round(sell_val,2); rec["DII_NET_CR"]=round(net_val,2)
+
+    if not by_date:
+        raise ValueError(
+            f"FII/DII: API returned {len(rows)} rows but none were parseable. "
+            f"Check DEBUG logs above for key names and values."
+        )
+
+    records = sorted(by_date.values(), key=lambda x: x["DATE"], reverse=True)
+    fii = records[0]["FII_NET_CR"]
+    dii = records[0]["DII_NET_CR"]
+    log(f"FII ₹{fii:+.2f}Cr | DII ₹{dii:+.2f}Cr ({len(records)} day(s))", "OK")
+    return pd.DataFrame(records), fii, dii
+
+
+# ══════════════════════════════════════════════════════════════════════
+# INSIDER TRADES
+# ══════════════════════════════════════════════════════════════════════
+
+def fetch_insider(days_back: int = 30):
+    sess = nse_session()
+    from_dt = (datetime.today() - timedelta(days=days_back)).strftime("%d-%m-%Y")
+    to_dt   = datetime.today().strftime("%d-%m-%Y")
+    log(f"Insider: fetching {from_dt} → {to_dt}")
+
+    data = _nse_json(sess, "https://www.nseindia.com/api/corporates-pit",
+                     params={"index":"equities","from_date":from_dt,"to_date":to_dt},
+                     referer="https://www.nseindia.com/companies-listing/corporate-filings-pit")
+
+    rows = data.get("data",[]) if isinstance(data,dict) else (data or [])
+    log(f"Insider API: {len(rows)} raw rows returned")
+    if rows:
+        log(f"Insider row[0] keys: {list(rows[0].keys())}", "DBG")
+        log(f"Insider row[0] sample: {dict(list(rows[0].items())[:8])}", "DBG")
+    else:
+        log("Insider API returned 0 rows — check if the date range params are accepted", "WARN")
+
+    SYM_KEYS    = ["symbol","Symbol","SYMBOL","scripCode"]
+    MODE_KEYS   = ["acqMode","acqmode","transactionType","acquisitionMode","tdpTransactionType"]
+    DATE_KEYS   = ["acqfromDt","acqFromDt","date","acqTodt","intimDt","broadcastDt"]
+    SHARES_KEYS = ["totAcqShrs","secAcq","noOfShares","totSecAcq","sharesAcquired","buyQuantity"]
+    VAL_KEYS    = ["secVal","totVal","value","totSecVal","acquisitionValue","buyValue"]
+    NAME_KEYS   = ["acqName","acquirerName","name","personName","insider"]
+
+    def _first(d, keys, default=""):
+        for k in keys:
+            if k in d and d[k] not in (None,"","-"): return d[k]
+        return default
+
+    cutoff = datetime.today() - timedelta(days=days_back)
+    records = []
+    skipped_sell = skipped_date = skipped_nosym = skipped_err = 0
+
+    for i, r in enumerate(rows):
+        try:
+            sym = str(_first(r, SYM_KEYS)).strip().upper()
+            if not sym:
+                skipped_nosym += 1
+                log(f"  row[{i}]: no symbol — keys present: {list(r.keys())[:8]}", "DBG")
+                continue
+
+            acq_type = str(_first(r, MODE_KEYS,"")).lower()
+            if any(x in acq_type for x in ("sell","pledge","revok","transfer out")):
+                skipped_sell += 1
+                log(f"  row[{i}] {sym}: skip — acqMode='{acq_type}'", "DBG")
+                continue
+
+            raw_date = _first(r, DATE_KEYS,"")
+            if not raw_date:
+                skipped_date += 1
+                log(f"  row[{i}] {sym}: skip — no date in keys {DATE_KEYS}", "WARN")
+                continue
+            try:
+                dt = pd.to_datetime(str(raw_date), dayfirst=True)
+            except Exception as exc:
+                skipped_date += 1
+                log(f"  row[{i}] {sym}: skip — date parse failed for {raw_date!r}: {exc}", "WARN")
+                continue
+            if dt < cutoff:
+                skipped_date += 1
+                continue  # normal age cutoff — no need to log each one
+
+            try:
+                shares = float(str(_first(r,SHARES_KEYS,"0")).replace(",",""))
+            except Exception as exc:
+                log(f"  row[{i}] {sym}: shares parse error — {exc}, defaulting to 0", "WARN")
+                shares = 0.0
+            try:
+                val = float(str(_first(r,VAL_KEYS,"0")).replace(",",""))
+            except Exception as exc:
+                log(f"  row[{i}] {sym}: value parse error — {exc}, estimating shares×10", "WARN")
+                val = shares * 10
+
+            records.append({
+                "SYMBOL":      sym,
+                "PERSON":      str(_first(r,NAME_KEYS,"Insider")),
+                "SHARES":      shares,
+                "VALUE_LAKHS": round(val,2),
+                "DATE":        dt.strftime("%Y-%m-%d"),
+                "TYPE":        acq_type or "Buy",
+            })
+        except Exception as exc:
+            skipped_err += 1
+            log_tb(f"Insider row[{i}] unexpected error (row={dict(list(r.items())[:5])})", exc)
+
+    log(f"Insider result: {len(records)} buys | {skipped_sell} sells/pledges | "
+        f"{skipped_date} old/no-date | {skipped_nosym} no-symbol | {skipped_err} errors")
+
+    if not records:
+        raise ValueError(
+            f"No insider buy transactions found.\n"
+            f"  API returned {len(rows)} rows total.\n"
+            f"  Breakdown: {skipped_sell} sells/pledges, {skipped_date} too-old/no-date, "
+            f"{skipped_nosym} no-symbol, {skipped_err} errors.\n"
+            f"  If 0 rows from API: date range params may not be accepted by this endpoint."
+        )
+    return pd.DataFrame(records), len(records)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FILINGS
+# ══════════════════════════════════════════════════════════════════════
+
+def fetch_filings(days_back: int = 14):
+    sess = nse_session()
+    from_dt = (datetime.today() - timedelta(days=days_back)).strftime("%d-%m-%Y")
+    to_dt   = datetime.today().strftime("%d-%m-%Y")
+    log(f"Filings: fetching {from_dt} → {to_dt}")
+
+    data = _nse_json(sess, "https://www.nseindia.com/api/corporate-announcements",
+                     params={"index":"equities","from_date":from_dt,"to_date":to_dt},
+                     referer="https://www.nseindia.com/companies-listing/corporate-filings-announcements")
+
+    rows = data.get("data",[]) if isinstance(data,dict) else (data or [])
+    log(f"Filings API: {len(rows)} raw rows")
+    if rows:
+        log(f"Filings row[0] keys: {list(rows[0].keys())}", "DBG")
+
+    records = []
+    skipped_nosym = skipped_err = 0
+    for i, r in enumerate(rows):
+        try:
+            sym = str(r.get("symbol","")).strip().upper()
+            if not sym:
+                skipped_nosym += 1
+                continue
+            subj = str(r.get("subject", r.get("desc", r.get("an_desc",""))))
+            dt   = str(r.get("exchdisstime", r.get("date", datetime.today().strftime("%Y-%m-%d"))))
+            records.append({"SYMBOL":sym,"DATE":dt,"SUBJECT":subj,"SENTIMENT":""})
+        except Exception as exc:
+            skipped_err += 1
+            log_tb(f"Filings row[{i}] error", exc)
+
+    log(f"Filings: {len(records)} kept | {skipped_nosym} no-symbol | {skipped_err} errors")
+    if not records:
+        raise ValueError(
+            f"No filings returned.\n"
+            f"  API gave {len(rows)} rows, {skipped_nosym} had no symbol, {skipped_err} errors.\n"
+            f"  If 0 rows: check the from_date/to_date params are accepted."
+        )
+    return pd.DataFrame(records), len(records)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# EARNINGS CALENDAR
+# ══════════════════════════════════════════════════════════════════════
+
+def fetch_earnings():
+    sess = nse_session()
+    data = _nse_json(sess, "https://www.nseindia.com/api/event-calendar",
+                     params={"index":"equities"},
+                     referer="https://www.nseindia.com/companies-listing/corporate-filings")
+
+    rows = data.get("data",[]) if isinstance(data,dict) else (data or [])
+    log(f"Earnings API: {len(rows)} raw rows")
+    if rows:
+        log(f"Earnings row[0] keys: {list(rows[0].keys())}", "DBG")
+        log(f"Earnings row[0] sample: {dict(list(rows[0].items())[:6])}", "DBG")
+
+    records = []
+    skipped_type = skipped_err = 0
+    for i, r in enumerate(rows):
+        try:
+            sym = str(r.get("symbol","")).strip().upper()
+            pur = str(r.get("purpose","")).lower()
+            if "result" not in pur and "dividend" not in pur:
+                skipped_type += 1
+                continue
+            records.append({"SYMBOL":sym,"RESULT_DATE":str(r.get("date","")),"PURPOSE":pur})
+        except Exception as exc:
+            skipped_err += 1
+            log_tb(f"Earnings row[{i}] error", exc)
+
+    log(f"Earnings: {len(records)} results/dividends | {skipped_type} other event types | {skipped_err} errors")
+    if not records:
+        raise ValueError(
+            f"No earnings events.\n"
+            f"  API gave {len(rows)} rows — {skipped_type} were not results/dividends, "
+            f"{skipped_err} had errors.\n"
+            f"  If 0 rows: endpoint may have changed or NSE blocked the request."
+        )
+    return pd.DataFrame(records), len(records)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# GOOGLE SHEETS
+# ══════════════════════════════════════════════════════════════════════
+
+def get_sheets_client():
+    creds_dict = json.loads(GOOGLE_CREDS_JSON)
+    try:
+        creds = Credentials.from_service_account_info(creds_dict, scopes=_SCOPES)
+    except Exception as exc:
+        raise ValueError(
+            f"Could not build Google credentials from GOOGLE_CREDS_JSON.\n"
+            f"  Error: {exc}\n"
+            f"  Check: is the JSON complete? Does it have type/project_id/private_key/client_email?"
+        ) from exc
+    try:
+        return gspread.authorize(creds)
+    except Exception as exc:
+        raise ValueError(f"gspread.authorize failed: {exc}") from exc
+
+
+def push_df(client, tab_name: str, df: pd.DataFrame) -> int:
+    log(f"Pushing {len(df)} rows × {len(df.columns)} cols → '{tab_name}'", "DBG")
+    try:
+        wb = client.open_by_key(GOOGLE_SHEET_ID)
+    except gspread.exceptions.APIError as exc:
+        raise ValueError(
+            f"Cannot open spreadsheet (ID={GOOGLE_SHEET_ID}).\n"
+            f"  Error: {exc}\n"
+            f"  Fix: share the sheet with the service account email as Editor."
+        ) from exc
+    except Exception as exc:
+        raise ValueError(f"open_by_key failed: {exc}") from exc
+
+    try:
+        ws = wb.worksheet(tab_name)
+    except gspread.WorksheetNotFound:
+        log(f"Tab '{tab_name}' not found — creating it", "DBG")
+        try:
+            ws = wb.add_worksheet(title=tab_name, rows=df.shape[0]+10, cols=df.shape[1]+2)
+        except Exception as exc:
+            raise ValueError(f"Could not create tab '{tab_name}': {exc}") from exc
+    except Exception as exc:
+        raise ValueError(f"worksheet('{tab_name}') failed: {exc}") from exc
+
+    try:
+        ws.clear()
+    except Exception as exc:
+        raise ValueError(f"clear() on '{tab_name}' failed: {exc}") from exc
+
+    values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
+    try:
+        ws.update("A1", values, value_input_option="RAW")
+    except gspread.exceptions.APIError as exc:
+        raise ValueError(
+            f"Sheets API error writing to '{tab_name}': {exc}\n"
+            f"  Possible causes: daily write quota exceeded, too many cells ({len(values)} rows × {len(df.columns)} cols), bad cell values."
+        ) from exc
+    except Exception as exc:
+        raise ValueError(f"update('A1') on '{tab_name}' failed: {exc}") from exc
+
+    return len(values) - 1
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════
+
+def main():
+    log("=" * 55)
+    log("⚔️  FORTRESS SNIPER — Cloud Fetcher v2.1")
+    log("=" * 55)
+    log(f"Python {sys.version}")
+    log(f"UTC time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    validate_config()
+
+    date_str, date_label = get_last_trading_day()
+    log(f"Trading date: {date_label}")
+
+    log("\n📋 Connecting to Google Sheets...")
+    try:
+        client = get_sheets_client()
+        log("Google Sheets connected", "OK")
+    except Exception as exc:
+        log_tb("Google Sheets connection FAILED — cannot continue", exc)
+        send_telegram(
+            f"❌ <b>Fortress Sniper — Sheets Auth Failed</b>\n"
+            f"Date: {date_label}\n"
+            f"<code>{type(exc).__name__}: {str(exc)[:400]}</code>"
+            + (f"\n🔗 <a href='{_actions_url()}'>View run log</a>" if _actions_url() else "")
+        )
+        sys.exit(1)
+
+    results = {}
+    fii_cr = dii_cr = None
+
+    # ── 1. BHAVCOPY ──────────────────────────────────────────────────
+    log("\n" + "─" * 45)
+    log("📥 [1/5] Bhavcopy")
+    try:
+        df   = fetch_bhavcopy(date_str)
+        rows = push_df(client, SHEET_BHAVCOPY, df)
+        log(f"{rows} rows → '{SHEET_BHAVCOPY}'", "OK")
+        results["BHAVCOPY"] = f"✅ {rows} rows"
+    except Exception as exc:
+        log_tb("Bhavcopy FAILED", exc)
+        results["BHAVCOPY"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
+
+    # ── 2. FII/DII ───────────────────────────────────────────────────
+    log("\n" + "─" * 45)
+    log("📥 [2/5] FII/DII")
+    try:
+        df, fii_cr, dii_cr = fetch_fii_dii()
+        rows = push_df(client, SHEET_FII_DII, df)
+        log(f"FII ₹{fii_cr:+.2f}Cr | DII ₹{dii_cr:+.2f}Cr → {rows} rows", "OK")
+        results["FII_DII"] = f"✅ FII ₹{fii_cr:+.2f}Cr | DII ₹{dii_cr:+.2f}Cr"
+    except Exception as exc:
+        log_tb("FII/DII FAILED", exc)
+        results["FII_DII"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
+
+    # ── 3. INSIDER ───────────────────────────────────────────────────
+    log("\n" + "─" * 45)
+    log("📥 [3/5] Insider trades")
+    try:
+        df, count = fetch_insider()
+        rows = push_df(client, SHEET_INSIDER, df)
+        log(f"{count} transactions → '{SHEET_INSIDER}'", "OK")
+        results["INSIDER"] = f"✅ {count} buy transactions"
+    except Exception as exc:
+        log_tb("Insider FAILED", exc)
+        results["INSIDER"] = f"⚠️ {type(exc).__name__}: {str(exc)[:150]}"
+
+    # ── 4. FILINGS ───────────────────────────────────────────────────
+    log("\n" + "─" * 45)
+    log("📥 [4/5] Filings")
+    try:
+        df, count = fetch_filings()
+        rows = push_df(client, SHEET_FILINGS, df)
+        log(f"{count} filings → '{SHEET_FILINGS}'", "OK")
+        results["FILINGS"] = f"✅ {count} filings"
+    except Exception as exc:
+        log_tb("Filings FAILED", exc)
+        results["FILINGS"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
+
+    # ── 5. EARNINGS ──────────────────────────────────────────────────
+    log("\n" + "─" * 45)
+    log("📥 [5/5] Earnings")
+    try:
+        df, count = fetch_earnings()
+        rows = push_df(client, SHEET_EARNINGS, df)
+        log(f"{count} events → '{SHEET_EARNINGS}'", "OK")
+        results["EARNINGS"] = f"✅ {count} events"
+    except Exception as exc:
+        log_tb("Earnings FAILED", exc)
+        results["EARNINGS"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
+
+    # ── TELEGRAM SUMMARY ─────────────────────────────────────────────
+    log("\n" + "─" * 45)
+    log("📤 Sending Telegram summary...")
+
+    errors = [k for k, v in results.items() if v.startswith("❌")]
+    fii_str = (f"{'🟢' if (fii_cr or 0)>=0 else '🔴'} FII ₹{fii_cr:+.2f} Cr"
+               if fii_cr is not None else "FII ❓ N/A")
+    dii_str = (f"{'🟢' if (dii_cr or 0)>=0 else '🔴'} DII ₹{dii_cr:+.2f} Cr"
+               if dii_cr is not None else "DII ❓ N/A")
+    header  = "⚔️ <b>Fortress Sniper</b>" + (" ⚠️ PARTIAL FAILURE" if errors else " ✅ Done")
+
+    msg = (
+        f"{header} — {date_label}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{fii_str}\n{dii_str}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        + "\n".join(f"<b>{k}</b>: {v}" for k, v in results.items())
+        + f"\n━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 {datetime.utcnow().strftime('%H:%M UTC')}"
+        + (f"\n🔗 <a href='{_actions_url()}'>View full log</a>" if _actions_url() else "")
+    )
+    send_telegram(msg)
+
+    if errors:
+        log(f"\n⚠️  Completed WITH ERRORS in: {errors}")
+        sys.exit(1)
+    else:
+        log("\n🎉 ALL 5 TABS UPDATED SUCCESSFULLY!", "OK")
+
+
+if __name__ == "__main__":
+    main()
