@@ -133,53 +133,41 @@ def _actions_url() -> str:
         return f"https://github.com/{GH_REPO}/actions/runs/{GH_RUN_ID}"
     return ""
 
+def _esc(s) -> str:
+    """HTML-escape a plain-text value for safe embedding in Telegram HTML mode."""
+    return (str(s)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
 def _tg_link(url: str, label: str) -> str:
-    """Return a safe Telegram HTML anchor, or empty string if url is empty."""
+    """Return a Telegram HTML anchor, or empty string if url is empty."""
     if not url:
         return ""
-    return f'<a href="{url}">{label}</a>'
+    return f'<a href="{url}">{_esc(label)}</a>'
+
+def _tg_bold(s) -> str:
+    return f"<b>{_esc(s)}</b>"
+
+def _tg_code(s) -> str:
+    return f"<code>{_esc(s)}</code>"
 
 def send_telegram(text: str):
-    """Send Telegram message. Never raises — logs failures instead.
+    """Send a Telegram message.  Never raises — logs failures instead.
 
-    The caller must pass text that already has its intentional HTML tags baked in
-    (via _tg_link / <b> / <code>). Any remaining < > & in literal content (e.g.
-    exception messages) are escaped here so Telegram never gets malformed entities.
-
-    Strategy: escape the whole string, then un-escape ONLY the exact safe-tag
-    substrings we emit ourselves. This is safe because our tags never contain
-    user-controlled content in tag names or attribute names.
+    Callers MUST use _tg_bold(), _tg_code(), _tg_link(), and _esc() for any
+    user/exception content embedded in the message.  send_telegram() sends text
+    verbatim with parse_mode=HTML — it does NOT escape anything itself.
+    Every raw string from NSE/exceptions must be wrapped in _esc() at the call
+    site before being inserted into the f-string.
     """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log("Telegram not configured — skipping", "WARN")
         return
-
-    SAFE_OPEN  = ["<b>", "<code>", "<i>"]
-    SAFE_CLOSE = ["</b>", "</code>", "</i>"]
-
-    # Step 1: escape everything
-    safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    # Step 2: un-escape known safe structural tags
-    for tag in SAFE_OPEN + SAFE_CLOSE:
-        escaped = tag.replace("<", "&lt;").replace(">", "&gt;")
-        safe = safe.replace(escaped, tag)
-
-    # Step 3: un-escape <a href="…">…</a> blocks that came from _tg_link.
-    # _tg_link always produces:  <a href="https://...">label</a>
-    # After escaping:            &lt;a href=&quot;https://...&quot;&gt;label&lt;/a&gt;
-    # We restore them with a simple regex restricted to https:// URLs only.
-    import re
-    safe = re.sub(
-        r'&lt;a href=&quot;(https://[^&"]+)&quot;&gt;([^&<]+)&lt;/a&gt;',
-        r'<a href="\1">\2</a>',
-        safe
-    )
-
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": safe,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
                   "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=20
         )
@@ -894,7 +882,7 @@ def push_df(client, tab_name: str, df: pd.DataFrame) -> int:
 
     values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
     try:
-        ws.update(values, "A1", value_input_option="RAW")
+        ws.update("A1", values, value_input_option="RAW")
     except gspread.exceptions.APIError as exc:
         raise ValueError(
             f"Sheets API error writing to '{tab_name}': {exc}\n"
@@ -929,9 +917,9 @@ def main():
     except Exception as exc:
         log_tb("Google Sheets connection FAILED — cannot continue", exc)
         send_telegram(
-            f"❌ <b>Fortress Sniper — Sheets Auth Failed</b>\n"
-            f"Date: {date_label}\n"
-            f"<code>{type(exc).__name__}: {str(exc)[:400]}</code>"
+            f"❌ {_tg_bold('Fortress Sniper — Sheets Auth Failed')}\n"
+            f"Date: {_esc(date_label)}\n"
+            f"{_tg_code(type(exc).__name__ + ': ' + str(exc)[:400])}"
             + (f"\n🔗 {_tg_link(_actions_url(), 'View run log')}" if _actions_url() else "")
         )
         sys.exit(1)
@@ -1015,7 +1003,7 @@ def main():
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{fii_str}\n{dii_str}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        + "\n".join(f"<b>{k}</b>: {v}" for k, v in results.items())
+        + "\n".join(f"{_tg_bold(k)}: {_esc(v)}" for k, v in results.items())
         + f"\n━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {datetime.utcnow().strftime('%H:%M UTC')}"
         + (f"\n🔗 {_tg_link(_actions_url(), 'View full log')}" if _actions_url() else "")
