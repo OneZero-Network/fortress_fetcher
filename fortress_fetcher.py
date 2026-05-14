@@ -133,25 +133,49 @@ def _actions_url() -> str:
         return f"https://github.com/{GH_REPO}/actions/runs/{GH_RUN_ID}"
     return ""
 
+def _tg_link(url: str, label: str) -> str:
+    """Return a safe Telegram HTML anchor, or empty string if url is empty."""
+    if not url:
+        return ""
+    return f'<a href="{url}">{label}</a>'
+
 def send_telegram(text: str):
-    """Send Telegram message. Never raises — logs failures instead."""
+    """Send Telegram message. Never raises — logs failures instead.
+
+    The caller must pass text that already has its intentional HTML tags baked in
+    (via _tg_link / <b> / <code>). Any remaining < > & in literal content (e.g.
+    exception messages) are escaped here so Telegram never gets malformed entities.
+
+    Strategy: escape the whole string, then un-escape ONLY the exact safe-tag
+    substrings we emit ourselves. This is safe because our tags never contain
+    user-controlled content in tag names or attribute names.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log("Telegram not configured — skipping", "WARN")
         return
-    # Escape raw user/exception text so <, >, & don't cause Telegram 400 errors.
-    # We do a targeted escape: protect only the unformatted parts by escaping the
-    # whole string, then restoring the intentional HTML tags we use.
-    # Simpler and safer: escape everything, then un-escape our known safe tags.
-    safe = (text
-        .replace("&", "&amp;")
-        .replace("<b>", "\x00B\x00").replace("</b>", "\x00/B\x00")
-        .replace("<code>", "\x00C\x00").replace("</code>", "\x00/C\x00")
-        .replace("<a ", "\x00A\x00").replace("</a>", "\x00/A\x00")
-        .replace("<", "&lt;").replace(">", "&gt;")
-        .replace("\x00B\x00", "<b>").replace("\x00/B\x00", "</b>")
-        .replace("\x00C\x00", "<code>").replace("\x00/C\x00", "</code>")
-        .replace("\x00A\x00", "<a ").replace("\x00/A\x00", "</a>")
+
+    SAFE_OPEN  = ["<b>", "<code>", "<i>"]
+    SAFE_CLOSE = ["</b>", "</code>", "</i>"]
+
+    # Step 1: escape everything
+    safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # Step 2: un-escape known safe structural tags
+    for tag in SAFE_OPEN + SAFE_CLOSE:
+        escaped = tag.replace("<", "&lt;").replace(">", "&gt;")
+        safe = safe.replace(escaped, tag)
+
+    # Step 3: un-escape <a href="…">…</a> blocks that came from _tg_link.
+    # _tg_link always produces:  <a href="https://...">label</a>
+    # After escaping:            &lt;a href=&quot;https://...&quot;&gt;label&lt;/a&gt;
+    # We restore them with a simple regex restricted to https:// URLs only.
+    import re
+    safe = re.sub(
+        r'&lt;a href=&quot;(https://[^&"]+)&quot;&gt;([^&<]+)&lt;/a&gt;',
+        r'<a href="\1">\2</a>',
+        safe
     )
+
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -870,7 +894,7 @@ def push_df(client, tab_name: str, df: pd.DataFrame) -> int:
 
     values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
     try:
-        ws.update("A1", values, value_input_option="RAW")
+        ws.update(values, "A1", value_input_option="RAW")
     except gspread.exceptions.APIError as exc:
         raise ValueError(
             f"Sheets API error writing to '{tab_name}': {exc}\n"
@@ -908,7 +932,7 @@ def main():
             f"❌ <b>Fortress Sniper — Sheets Auth Failed</b>\n"
             f"Date: {date_label}\n"
             f"<code>{type(exc).__name__}: {str(exc)[:400]}</code>"
-            + (f"\n🔗 <a href='{_actions_url()}'>View run log</a>" if _actions_url() else "")
+            + (f"\n🔗 {_tg_link(_actions_url(), 'View run log')}" if _actions_url() else "")
         )
         sys.exit(1)
 
@@ -994,7 +1018,7 @@ def main():
         + "\n".join(f"<b>{k}</b>: {v}" for k, v in results.items())
         + f"\n━━━━━━━━━━━━━━━━━━\n"
         f"🕐 {datetime.utcnow().strftime('%H:%M UTC')}"
-        + (f"\n🔗 <a href='{_actions_url()}'>View full log</a>" if _actions_url() else "")
+        + (f"\n🔗 {_tg_link(_actions_url(), 'View full log')}" if _actions_url() else "")
     )
     send_telegram(msg)
 
