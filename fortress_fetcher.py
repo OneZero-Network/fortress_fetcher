@@ -262,6 +262,11 @@ def _nse_json(sess, url: str, params=None, timeout: int = 20, referer: str = Non
         try:
             resp = sess.get(url, params=params, timeout=timeout, headers=req_headers)
         except requests.exceptions.Timeout:
+            if attempt < _retry:
+                wait = 8 * attempt
+                log(f"TIMEOUT — backing off {wait}s before retry {attempt}/{_retry - 1}...", "WARN")
+                time.sleep(wait)
+                continue
             raise ValueError(f"NSE request timed out after {timeout}s\n  URL: {url}")
         except requests.exceptions.ConnectionError as exc:
             raise ValueError(f"NSE connection error: {exc}\n  URL: {url}")
@@ -654,7 +659,8 @@ def fetch_insider(days_back: int = 30):
 
     data = _nse_json(sess, "https://www.nseindia.com/api/corporates-pit",
                      params={"index":"equities","from_date":from_dt,"to_date":to_dt},
-                     referer="https://www.nseindia.com/companies-listing/corporate-filings-pit")
+                     referer="https://www.nseindia.com/companies-listing/corporate-filings-pit",
+                     timeout=45)
 
     rows = data.get("data",[]) if isinstance(data,dict) else (data or [])
     log(f"Insider API: {len(rows)} raw rows returned")
@@ -758,7 +764,8 @@ def fetch_filings(days_back: int = 14):
 
     data = _nse_json(sess, "https://www.nseindia.com/api/corporate-announcements",
                      params={"index":"equities","from_date":from_dt,"to_date":to_dt},
-                     referer="https://www.nseindia.com/companies-listing/corporate-filings-announcements")
+                     referer="https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+                     timeout=45)
 
     rows = data.get("data",[]) if isinstance(data,dict) else (data or [])
     log(f"Filings API: {len(rows)} raw rows")
