@@ -889,7 +889,7 @@ def push_df(client, tab_name: str, df: pd.DataFrame) -> int:
 
     values = [df.columns.tolist()] + df.fillna("").astype(str).values.tolist()
     try:
-        ws.update("A1", values, value_input_option="RAW")
+        ws.update(range_name="A1", values=values, value_input_option="RAW")
     except gspread.exceptions.APIError as exc:
         raise ValueError(
             f"Sheets API error writing to '{tab_name}': {exc}\n"
