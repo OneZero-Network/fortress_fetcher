@@ -4,7 +4,7 @@ on:
   # Runs at 19:00 IST (13:30 UTC) Mon–Fri — after NSE archive files are published.
   # Previously 16:00 IST which was too early; bhavcopy ZIPs land ~18:00–19:00 IST.
   schedule:
-    - cron: "30 13 * * 1-5"
+    - cron: "30 13 * * 0-4"
 
   # Manual trigger from trigger.html or GitHub UI
   workflow_dispatch:
