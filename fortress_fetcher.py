@@ -13,15 +13,16 @@
 ║    GITHUB_RUN_ID       — set automatically by GitHub Actions       ║
 ║                                                                      ║
 ║  v2.2 changes vs v2.1:                                             ║
-║    - BUGFIX: fetch_insider() used datetime.today() (UTC on GitHub  ║
-║      Actions) — now uses datetime.utcnow()+5:30 (IST) so to_date  ║
-║      is always the correct Indian calendar date. This was causing  ║
-║      old data (e.g. Apr 30) to be returned when run after midnight ║
-║      UTC but before 05:30 IST.                                     ║
-║    - BUGFIX: fetch_filings() had the same datetime.today() UTC bug ║
-║      — fixed to IST in both from_dt/to_dt and the per-row         ║
-║      date fallback.                                                 ║
-║    - BUGFIX: insider cutoff comparison also fixed to use IST now   ║
+║    - BUGFIX: fetch_insider() DATE_KEYS reordered — intimDt /       ║
+║      broadcastDt (filing date) now used for cutoff filter instead  ║
+║      of acqfromDt (acquisition start date), which could be weeks   ║
+║      old and caused valid May trades to be dropped as "too old"    ║
+║    - BUGFIX: acqfromDt / acqTodt kept separately as TRADE_FROM /   ║
+║      TRADE_TO columns for display; intimDt used for DATE column    ║
+║    - BUGFIX: cutoff comparison made timezone-safe (pd.Timestamp)   ║
+║    - BUGFIX: fetch_insider/fetch_filings use IST (utcnow+5:30)     ║
+║      not datetime.today() which returns UTC on GitHub Actions      ║
+║    - BUGFIX: fetch_filings per-row date fallback also uses IST     ║
 ║  v2.1 changes vs v2.0:                                             ║
 ║    - Full traceback logged for every exception, everywhere         ║
 ║    - No silent except:/continue blocks — every skip is logged      ║
@@ -663,10 +664,12 @@ def fetch_fii_dii():
 
 def fetch_insider(days_back: int = 30):
     sess = nse_session()
-    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)   # always use IST, not UTC
+    # Always use IST — GitHub Actions runners run on UTC, datetime.today() would
+    # return the wrong calendar date before 05:30 IST each morning.
+    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     from_dt = (now_ist - timedelta(days=days_back)).strftime("%d-%m-%Y")
     to_dt   = now_ist.strftime("%d-%m-%Y")
-    log(f"Insider: fetching {from_dt} → {to_dt}")
+    log(f"Insider: fetching {from_dt} → {to_dt} (IST: {now_ist.strftime('%Y-%m-%d %H:%M')})")
 
     data = _nse_json(sess, "https://www.nseindia.com/api/corporates-pit",
                      params={"index":"equities","from_date":from_dt,"to_date":to_dt},
@@ -683,7 +686,13 @@ def fetch_insider(days_back: int = 30):
 
     SYM_KEYS    = ["symbol","Symbol","SYMBOL","scripCode"]
     MODE_KEYS   = ["acqMode","acqmode","transactionType","acquisitionMode","tdpTransactionType"]
-    DATE_KEYS   = ["acqfromDt","acqFromDt","date","acqTodt","intimDt","broadcastDt"]
+    # DATE_KEYS for CUTOFF FILTERING — must use the NSE *filing/intimation* date, NOT the
+    # acquisition-from date. acqfromDt is when the insider STARTED buying (can be weeks ago),
+    # so using it for recency filtering drops valid recent filings. intimDt / broadcastDt is
+    # when the transaction was filed with NSE — that's what we filter on.
+    FILING_DATE_KEYS = ["intimDt","broadcastDt","date"]          # filing date — used for cutoff
+    TRADE_FROM_KEYS  = ["acqfromDt","acqFromDt"]                 # trade start — display only
+    TRADE_TO_KEYS    = ["acqTodt","acqToDt"]                     # trade end   — display only
     SHARES_KEYS = ["totAcqShrs","secAcq","noOfShares","totSecAcq","sharesAcquired","buyQuantity"]
     VAL_KEYS    = ["secVal","totVal","value","totSecVal","acquisitionValue","buyValue"]
     NAME_KEYS   = ["acqName","acquirerName","name","personName","insider"]
@@ -693,7 +702,22 @@ def fetch_insider(days_back: int = 30):
             if k in d and d[k] not in (None,"","-"): return d[k]
         return default
 
-    cutoff = now_ist - timedelta(days=days_back)
+    def _safe_dt(raw, label):
+        """Parse a date string to a tz-naive pandas Timestamp, or return None."""
+        if not raw:
+            return None
+        try:
+            ts = pd.to_datetime(str(raw), dayfirst=True)
+            # Strip timezone so comparisons with naive cutoff always work
+            if ts.tzinfo is not None:
+                ts = ts.tz_localize(None)
+            return ts
+        except Exception as exc:
+            log(f"  {label}: date parse failed for {raw!r}: {exc}", "WARN")
+            return None
+
+    # cutoff based on IST now — timezone-naive for safe comparison
+    cutoff = pd.Timestamp(now_ist.replace(tzinfo=None) - timedelta(days=days_back))
     records = []
     skipped_sell = skipped_date = skipped_nosym = skipped_err = 0
 
@@ -711,20 +735,27 @@ def fetch_insider(days_back: int = 30):
                 log(f"  row[{i}] {sym}: skip — acqMode='{acq_type}'", "DBG")
                 continue
 
-            raw_date = _first(r, DATE_KEYS,"")
-            if not raw_date:
+            # Use filing date for recency check — this is always the most recent date on the row
+            raw_filing = _first(r, FILING_DATE_KEYS, "")
+            if not raw_filing:
                 skipped_date += 1
-                log(f"  row[{i}] {sym}: skip — no date in keys {DATE_KEYS}", "WARN")
+                log(f"  row[{i}] {sym}: skip — no filing date in keys {FILING_DATE_KEYS}. "
+                    f"Row keys: {list(r.keys())}", "WARN")
                 continue
-            try:
-                dt = pd.to_datetime(str(raw_date), dayfirst=True)
-            except Exception as exc:
+
+            filing_dt = _safe_dt(raw_filing, f"row[{i}] {sym} filing_dt")
+            if filing_dt is None:
                 skipped_date += 1
-                log(f"  row[{i}] {sym}: skip — date parse failed for {raw_date!r}: {exc}", "WARN")
                 continue
-            if dt < cutoff:
+
+            if filing_dt < cutoff:
                 skipped_date += 1
-                continue  # normal age cutoff — no need to log each one
+                log(f"  row[{i}] {sym}: skip — filing date {filing_dt.date()} < cutoff {cutoff.date()}", "DBG")
+                continue
+
+            # Trade period dates — for display only, not for filtering
+            trade_from = _first(r, TRADE_FROM_KEYS, "")
+            trade_to   = _first(r, TRADE_TO_KEYS,   "")
 
             try:
                 shares = float(str(_first(r,SHARES_KEYS,"0")).replace(",",""))
@@ -742,7 +773,9 @@ def fetch_insider(days_back: int = 30):
                 "PERSON":      str(_first(r,NAME_KEYS,"Insider")),
                 "SHARES":      shares,
                 "VALUE_LAKHS": round(val,2),
-                "DATE":        dt.strftime("%Y-%m-%d"),
+                "DATE":        filing_dt.strftime("%Y-%m-%d"),   # filing/intimation date
+                "TRADE_FROM":  trade_from,                        # raw trade period start
+                "TRADE_TO":    trade_to,                          # raw trade period end
                 "TYPE":        acq_type or "Buy",
             })
         except Exception as exc:
@@ -758,7 +791,8 @@ def fetch_insider(days_back: int = 30):
             f"  API returned {len(rows)} rows total.\n"
             f"  Breakdown: {skipped_sell} sells/pledges, {skipped_date} too-old/no-date, "
             f"{skipped_nosym} no-symbol, {skipped_err} errors.\n"
-            f"  If 0 rows from API: date range params may not be accepted by this endpoint."
+            f"  If 0 rows from API: date range params may not be accepted by this endpoint.\n"
+            f"  Check DEBUG logs — look for 'filing date' lines to confirm which date key was found."
         )
     return pd.DataFrame(records), len(records)
 
@@ -769,7 +803,7 @@ def fetch_insider(days_back: int = 30):
 
 def fetch_filings(days_back: int = 14):
     sess = nse_session()
-    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)   # always use IST, not UTC
+    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)   # IST, not UTC
     from_dt = (now_ist - timedelta(days=days_back)).strftime("%d-%m-%Y")
     to_dt   = now_ist.strftime("%d-%m-%Y")
     log(f"Filings: fetching {from_dt} → {to_dt}")
