@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  FORTRESS SNIPER — Cloud Fetcher v2.1                              ║
+║  FORTRESS SNIPER — Cloud Fetcher v2.2                              ║
 ║  Runs headless on GitHub Actions (no GUI, no Tkinter)              ║
 ║                                                                      ║
 ║  All config via GitHub Secrets (environment variables):             ║
@@ -12,6 +12,16 @@
 ║    GITHUB_REPOSITORY   — set automatically by GitHub Actions       ║
 ║    GITHUB_RUN_ID       — set automatically by GitHub Actions       ║
 ║                                                                      ║
+║  v2.2 changes vs v2.1:                                             ║
+║    - BUGFIX: fetch_insider() used datetime.today() (UTC on GitHub  ║
+║      Actions) — now uses datetime.utcnow()+5:30 (IST) so to_date  ║
+║      is always the correct Indian calendar date. This was causing  ║
+║      old data (e.g. Apr 30) to be returned when run after midnight ║
+║      UTC but before 05:30 IST.                                     ║
+║    - BUGFIX: fetch_filings() had the same datetime.today() UTC bug ║
+║      — fixed to IST in both from_dt/to_dt and the per-row         ║
+║      date fallback.                                                 ║
+║    - BUGFIX: insider cutoff comparison also fixed to use IST now   ║
 ║  v2.1 changes vs v2.0:                                             ║
 ║    - Full traceback logged for every exception, everywhere         ║
 ║    - No silent except:/continue blocks — every skip is logged      ║
@@ -653,8 +663,9 @@ def fetch_fii_dii():
 
 def fetch_insider(days_back: int = 30):
     sess = nse_session()
-    from_dt = (datetime.today() - timedelta(days=days_back)).strftime("%d-%m-%Y")
-    to_dt   = datetime.today().strftime("%d-%m-%Y")
+    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)   # always use IST, not UTC
+    from_dt = (now_ist - timedelta(days=days_back)).strftime("%d-%m-%Y")
+    to_dt   = now_ist.strftime("%d-%m-%Y")
     log(f"Insider: fetching {from_dt} → {to_dt}")
 
     data = _nse_json(sess, "https://www.nseindia.com/api/corporates-pit",
@@ -682,7 +693,7 @@ def fetch_insider(days_back: int = 30):
             if k in d and d[k] not in (None,"","-"): return d[k]
         return default
 
-    cutoff = datetime.today() - timedelta(days=days_back)
+    cutoff = now_ist - timedelta(days=days_back)
     records = []
     skipped_sell = skipped_date = skipped_nosym = skipped_err = 0
 
@@ -758,8 +769,9 @@ def fetch_insider(days_back: int = 30):
 
 def fetch_filings(days_back: int = 14):
     sess = nse_session()
-    from_dt = (datetime.today() - timedelta(days=days_back)).strftime("%d-%m-%Y")
-    to_dt   = datetime.today().strftime("%d-%m-%Y")
+    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)   # always use IST, not UTC
+    from_dt = (now_ist - timedelta(days=days_back)).strftime("%d-%m-%Y")
+    to_dt   = now_ist.strftime("%d-%m-%Y")
     log(f"Filings: fetching {from_dt} → {to_dt}")
 
     data = _nse_json(sess, "https://www.nseindia.com/api/corporate-announcements",
@@ -781,7 +793,7 @@ def fetch_filings(days_back: int = 14):
                 skipped_nosym += 1
                 continue
             subj = str(r.get("subject", r.get("desc", r.get("an_desc",""))))
-            dt   = str(r.get("exchdisstime", r.get("date", datetime.today().strftime("%Y-%m-%d"))))
+            dt   = str(r.get("exchdisstime", r.get("date", now_ist.strftime("%Y-%m-%d"))))
             records.append({"SYMBOL":sym,"DATE":dt,"SUBJECT":subj,"SENTIMENT":""})
         except Exception as exc:
             skipped_err += 1
@@ -907,7 +919,7 @@ def push_df(client, tab_name: str, df: pd.DataFrame) -> int:
 
 def main():
     log("=" * 55)
-    log("⚔️  FORTRESS SNIPER — Cloud Fetcher v2.1")
+    log("⚔️  FORTRESS SNIPER — Cloud Fetcher v2.2")
     log("=" * 55)
     log(f"Python {sys.version}")
     log(f"UTC time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
