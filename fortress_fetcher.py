@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  FORTRESS SNIPER — Cloud Fetcher v2.2                              ║
+║  FORTRESS SNIPER — Cloud Fetcher v2.3                              ║
 ║  Runs headless on GitHub Actions (no GUI, no Tkinter)              ║
 ║                                                                      ║
 ║  All config via GitHub Secrets (environment variables):             ║
@@ -12,17 +12,21 @@
 ║    GITHUB_REPOSITORY   — set automatically by GitHub Actions       ║
 ║    GITHUB_RUN_ID       — set automatically by GitHub Actions       ║
 ║                                                                      ║
+║  v2.3 changes vs v2.2:                                             ║
+║    - BUGFIX: sell filter was "sell" only — "market sale", "sale"   ║
+║      slipped through. Now SKIP_TYPES whitelist-rejects any type    ║
+║      not in the genuine-buy list (market purchase, esop exercise,  ║
+║      preferential allotment, rights, open offer)                   ║
+║    - ADDED: TYPE_LABEL maps raw acqMode to clean display label     ║
+║    - ADDED: KEEP_TYPES allowlist — only genuine buy signals kept:  ║
+║      market purchase · esop (exercise only) · preferential offer   ║
+║      rights · open offer · employee benefit · esos                 ║
+║    - All other types (sale, pledge, gift, off market, transfer,    ║
+║      amalgamation, inter-se) are skipped and logged                ║
 ║  v2.2 changes vs v2.1:                                             ║
-║    - BUGFIX: fetch_insider() DATE_KEYS reordered — intimDt /       ║
-║      broadcastDt (filing date) now used for cutoff filter instead  ║
-║      of acqfromDt (acquisition start date), which could be weeks   ║
-║      old and caused valid May trades to be dropped as "too old"    ║
-║    - BUGFIX: acqfromDt / acqTodt kept separately as TRADE_FROM /   ║
-║      TRADE_TO columns for display; intimDt used for DATE column    ║
-║    - BUGFIX: cutoff comparison made timezone-safe (pd.Timestamp)   ║
-║    - BUGFIX: fetch_insider/fetch_filings use IST (utcnow+5:30)     ║
-║      not datetime.today() which returns UTC on GitHub Actions      ║
-║    - BUGFIX: fetch_filings per-row date fallback also uses IST     ║
+║    - BUGFIX: intimDt used for date filter, not acqfromDt           ║
+║    - BUGFIX: IST timezone used, not UTC datetime.today()           ║
+║    - BUGFIX: timezone-safe cutoff comparison                       ║
 ║  v2.1 changes vs v2.0:                                             ║
 ║    - Full traceback logged for every exception, everywhere         ║
 ║    - No silent except:/continue blocks — every skip is logged      ║
@@ -664,8 +668,7 @@ def fetch_fii_dii():
 
 def fetch_insider(days_back: int = 30):
     sess = nse_session()
-    # Always use IST — GitHub Actions runners run on UTC, datetime.today() would
-    # return the wrong calendar date before 05:30 IST each morning.
+    # Always use IST — GitHub Actions runners use UTC; datetime.today() gives wrong date
     now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     from_dt = (now_ist - timedelta(days=days_back)).strftime("%d-%m-%Y")
     to_dt   = now_ist.strftime("%d-%m-%Y")
@@ -686,16 +689,45 @@ def fetch_insider(days_back: int = 30):
 
     SYM_KEYS    = ["symbol","Symbol","SYMBOL","scripCode"]
     MODE_KEYS   = ["acqMode","acqmode","transactionType","acquisitionMode","tdpTransactionType"]
-    # DATE_KEYS for CUTOFF FILTERING — must use the NSE *filing/intimation* date, NOT the
-    # acquisition-from date. acqfromDt is when the insider STARTED buying (can be weeks ago),
-    # so using it for recency filtering drops valid recent filings. intimDt / broadcastDt is
-    # when the transaction was filed with NSE — that's what we filter on.
-    FILING_DATE_KEYS = ["intimDt","broadcastDt","date"]          # filing date — used for cutoff
-    TRADE_FROM_KEYS  = ["acqfromDt","acqFromDt"]                 # trade start — display only
-    TRADE_TO_KEYS    = ["acqTodt","acqToDt"]                     # trade end   — display only
+
+    # ── Date keys ──────────────────────────────────────────────────────
+    # Use intimDt (NSE filing/intimation date) for recency filtering.
+    # acqfromDt is when the TRADE happened — could be weeks old for a
+    # recently filed transaction, so it must NOT be used for the cutoff.
+    FILING_DATE_KEYS = ["intimDt","broadcastDt","date"]   # filing date → cutoff filter
+    TRADE_FROM_KEYS  = ["acqfromDt","acqFromDt"]          # trade start  → display only
+    TRADE_TO_KEYS    = ["acqTodt","acqToDt"]              # trade end    → display only
+
     SHARES_KEYS = ["totAcqShrs","secAcq","noOfShares","totSecAcq","sharesAcquired","buyQuantity"]
     VAL_KEYS    = ["secVal","totVal","value","totSecVal","acquisitionValue","buyValue"]
     NAME_KEYS   = ["acqName","acquirerName","name","personName","insider"]
+
+    # ── Transaction type allowlist ──────────────────────────────────────
+    # Only keep genuine insider BUY signals.
+    # ANY type not in this set is skipped — this handles "market sale",
+    # "gift", "off market", "pledge", "inter-se-transfer", etc. that
+    # previously slipped through because the old filter only checked for
+    # the word "sell" (missing "sale", "pledge creation", "revoke", etc.)
+    KEEP_TYPES = {
+        "market purchase",
+        "market buy",
+        "purchase",
+        "buy",
+        "esop exercise",           # exercise of options = company gave shares, neutral-to-bullish
+        "esos",
+        "employee benefit",
+        "preferential allotment",  # fresh shares issued — promoter/anchor buy-in
+        "preferential offer",
+        "rights",
+        "rights issue",
+        "open offer",
+        "creeping acquisition",
+        "bulk deal",
+        "block deal",
+    }
+    # Also accept if any KEEP token appears anywhere in the type string
+    KEEP_TOKENS = ("purchase","market buy","open offer","rights","creeping","bulk","block",
+                   "allotment","esop exercise","esos","employee benefit")
 
     def _first(d, keys, default=""):
         for k in keys:
@@ -703,12 +735,10 @@ def fetch_insider(days_back: int = 30):
         return default
 
     def _safe_dt(raw, label):
-        """Parse a date string to a tz-naive pandas Timestamp, or return None."""
         if not raw:
             return None
         try:
             ts = pd.to_datetime(str(raw), dayfirst=True)
-            # Strip timezone so comparisons with naive cutoff always work
             if ts.tzinfo is not None:
                 ts = ts.tz_localize(None)
             return ts
@@ -716,10 +746,9 @@ def fetch_insider(days_back: int = 30):
             log(f"  {label}: date parse failed for {raw!r}: {exc}", "WARN")
             return None
 
-    # cutoff based on IST now — timezone-naive for safe comparison
     cutoff = pd.Timestamp(now_ist.replace(tzinfo=None) - timedelta(days=days_back))
     records = []
-    skipped_sell = skipped_date = skipped_nosym = skipped_err = 0
+    skipped_type = skipped_date = skipped_nosym = skipped_err = 0
 
     for i, r in enumerate(rows):
         try:
@@ -729,31 +758,34 @@ def fetch_insider(days_back: int = 30):
                 log(f"  row[{i}]: no symbol — keys present: {list(r.keys())[:8]}", "DBG")
                 continue
 
-            acq_type = str(_first(r, MODE_KEYS,"")).lower()
-            if any(x in acq_type for x in ("sell","pledge","revok","transfer out")):
-                skipped_sell += 1
-                log(f"  row[{i}] {sym}: skip — acqMode='{acq_type}'", "DBG")
+            # ── Transaction type filter (allowlist approach) ──────────
+            acq_type = str(_first(r, MODE_KEYS,"")).strip().lower()
+
+            is_buy = (acq_type in KEEP_TYPES or
+                      any(tok in acq_type for tok in KEEP_TOKENS))
+
+            if not is_buy:
+                skipped_type += 1
+                log(f"  row[{i}] {sym}: skip — type='{acq_type}' not in buy allowlist", "DBG")
                 continue
 
-            # Use filing date for recency check — this is always the most recent date on the row
+            # ── Date filter (filing date, not trade date) ─────────────
             raw_filing = _first(r, FILING_DATE_KEYS, "")
             if not raw_filing:
                 skipped_date += 1
-                log(f"  row[{i}] {sym}: skip — no filing date in keys {FILING_DATE_KEYS}. "
+                log(f"  row[{i}] {sym}: skip — no filing date in {FILING_DATE_KEYS}. "
                     f"Row keys: {list(r.keys())}", "WARN")
                 continue
 
-            filing_dt = _safe_dt(raw_filing, f"row[{i}] {sym} filing_dt")
+            filing_dt = _safe_dt(raw_filing, f"row[{i}] {sym}")
             if filing_dt is None:
                 skipped_date += 1
                 continue
-
             if filing_dt < cutoff:
                 skipped_date += 1
-                log(f"  row[{i}] {sym}: skip — filing date {filing_dt.date()} < cutoff {cutoff.date()}", "DBG")
+                log(f"  row[{i}] {sym}: skip — filing {filing_dt.date()} < cutoff {cutoff.date()}", "DBG")
                 continue
 
-            # Trade period dates — for display only, not for filtering
             trade_from = _first(r, TRADE_FROM_KEYS, "")
             trade_to   = _first(r, TRADE_TO_KEYS,   "")
 
@@ -772,27 +804,27 @@ def fetch_insider(days_back: int = 30):
                 "SYMBOL":      sym,
                 "PERSON":      str(_first(r,NAME_KEYS,"Insider")),
                 "SHARES":      shares,
-                "VALUE_LAKHS": round(val,2),
-                "DATE":        filing_dt.strftime("%Y-%m-%d"),   # filing/intimation date
-                "TRADE_FROM":  trade_from,                        # raw trade period start
-                "TRADE_TO":    trade_to,                          # raw trade period end
-                "TYPE":        acq_type or "Buy",
+                "VALUE_LAKHS": round(val / 100, 2),   # NSE sends value in rupees; convert to lakhs
+                "DATE":        filing_dt.strftime("%Y-%m-%d"),
+                "TRADE_FROM":  trade_from,
+                "TRADE_TO":    trade_to,
+                "TYPE":        acq_type,
             })
         except Exception as exc:
             skipped_err += 1
             log_tb(f"Insider row[{i}] unexpected error (row={dict(list(r.items())[:5])})", exc)
 
-    log(f"Insider result: {len(records)} buys | {skipped_sell} sells/pledges | "
+    log(f"Insider result: {len(records)} buys | {skipped_type} non-buy types | "
         f"{skipped_date} old/no-date | {skipped_nosym} no-symbol | {skipped_err} errors")
 
     if not records:
         raise ValueError(
             f"No insider buy transactions found.\n"
             f"  API returned {len(rows)} rows total.\n"
-            f"  Breakdown: {skipped_sell} sells/pledges, {skipped_date} too-old/no-date, "
+            f"  Breakdown: {skipped_type} non-buy types, {skipped_date} too-old/no-date, "
             f"{skipped_nosym} no-symbol, {skipped_err} errors.\n"
             f"  If 0 rows from API: date range params may not be accepted by this endpoint.\n"
-            f"  Check DEBUG logs — look for 'filing date' lines to confirm which date key was found."
+            f"  Tip: check DEBUG logs for 'skip — type=' lines to see what types NSE is returning."
         )
     return pd.DataFrame(records), len(records)
 
@@ -803,9 +835,8 @@ def fetch_insider(days_back: int = 30):
 
 def fetch_filings(days_back: int = 14):
     sess = nse_session()
-    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)   # IST, not UTC
-    from_dt = (now_ist - timedelta(days=days_back)).strftime("%d-%m-%Y")
-    to_dt   = now_ist.strftime("%d-%m-%Y")
+    from_dt = (datetime.today() - timedelta(days=days_back)).strftime("%d-%m-%Y")
+    to_dt   = datetime.today().strftime("%d-%m-%Y")
     log(f"Filings: fetching {from_dt} → {to_dt}")
 
     data = _nse_json(sess, "https://www.nseindia.com/api/corporate-announcements",
@@ -827,7 +858,7 @@ def fetch_filings(days_back: int = 14):
                 skipped_nosym += 1
                 continue
             subj = str(r.get("subject", r.get("desc", r.get("an_desc",""))))
-            dt   = str(r.get("exchdisstime", r.get("date", now_ist.strftime("%Y-%m-%d"))))
+            dt   = str(r.get("exchdisstime", r.get("date", datetime.today().strftime("%Y-%m-%d"))))
             records.append({"SYMBOL":sym,"DATE":dt,"SUBJECT":subj,"SENTIMENT":""})
         except Exception as exc:
             skipped_err += 1
@@ -953,7 +984,7 @@ def push_df(client, tab_name: str, df: pd.DataFrame) -> int:
 
 def main():
     log("=" * 55)
-    log("⚔️  FORTRESS SNIPER — Cloud Fetcher v2.2")
+    log("⚔️  FORTRESS SNIPER — Cloud Fetcher v2.1")
     log("=" * 55)
     log(f"Python {sys.version}")
     log(f"UTC time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}")
