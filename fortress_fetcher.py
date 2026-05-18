@@ -666,7 +666,7 @@ def fetch_fii_dii():
 # INSIDER TRADES
 # ══════════════════════════════════════════════════════════════════════
 
-def fetch_insider(days_back: int = 30):
+def fetch_insider(days_back: int = 10):
     sess = nse_session()
     # Always use IST — GitHub Actions runners use UTC; datetime.today() gives wrong date
     now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
