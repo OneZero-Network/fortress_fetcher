@@ -12,6 +12,24 @@
 ║    GITHUB_REPOSITORY   — set automatically by GitHub Actions       ║
 ║    GITHUB_RUN_ID       — set automatically by GitHub Actions       ║
 ║                                                                      ║
+║  v2.4 changes vs v2.3 (Insider/Filings timeout hybrid fix):        ║
+║    - Insider + Filings (corporates-pit / corporate-announcements)  ║
+║      now run FIRST in main(), right after shared warmup, so they   ║
+║      get the freshest session and least prior traffic in the run  ║
+║    - Added per-path throttle (6s) for these two endpoints only,    ║
+║      independent of the global 2.5s gap — full-duration hangs      ║
+║      that clear on retry look like a path-specific tarpit, not a   ║
+║      client-fingerprint block                                      ║
+║    - Added section-page warmup (the actual companies-listing page ║
+║      a browser would visit) before calling these two endpoints,    ║
+║      not just the generic homepage/market-data warmup              ║
+║    - Every NSE response now logs diagnostic headers (Server,       ║
+║      cf-ray, X-RateLimit-*, Retry-After, Set-Cookie, etc.) so a    ║
+║      future timeout/stub carries evidence of what's actually       ║
+║      fronting the endpoint, instead of just a guess                ║
+║    - BUGFIX: fetch_filings used UTC datetime.today() instead of    ║
+║      IST — same class of bug already fixed in fetch_insider         ║
+║                                                                      ║
 ║  v2.3 changes vs v2.2:                                             ║
 ║    - BUGFIX: sell filter was "sell" only — "market sale", "sale"   ║
 ║      slipped through. Now SKIP_TYPES whitelist-rejects any type    ║
@@ -141,12 +159,56 @@ def _next_fingerprint():
 _MIN_REQUEST_GAP_SEC = 2.5
 _last_request_ts = {"t": 0.0}
 
-def _throttle():
+# ── Per-path throttle ─────────────────────────────────────────────────
+# corporates-pit and corporate-announcements consistently hang for the
+# FULL timeout duration (not a fast 403/redirect) while every other NSE
+# endpoint hit in the same run, same session, responds fast. A fast
+# JS-challenge/bot-check normally answers quickly (small HTML/JS payload
+# or an instant 403) — it doesn't sit on the connection. A slow/silent
+# hang that clears on a *different* attempt is the signature of a
+# path-specific rate-limiter/tarpit sitting in front of just these two
+# endpoints. So in addition to the global gap above, these paths get
+# their own longer minimum spacing, independent of what else the script
+# has been doing.
+_PATH_THROTTLE_GAP_SEC = {
+    "/api/corporates-pit": 6.0,
+    "/api/corporate-announcements": 6.0,
+}
+_last_path_request_ts: dict = {}
+
+def _throttle(path_key: str = None):
     now = time.time()
     wait = _last_request_ts["t"] + _MIN_REQUEST_GAP_SEC - now
+    if path_key and path_key in _PATH_THROTTLE_GAP_SEC:
+        gap = _PATH_THROTTLE_GAP_SEC[path_key]
+        last = _last_path_request_ts.get(path_key, 0.0)
+        path_wait = last + gap - now
+        wait = max(wait, path_wait)
     if wait > 0:
         time.sleep(wait)
-    _last_request_ts["t"] = time.time()
+    now2 = time.time()
+    _last_request_ts["t"] = now2
+    if path_key:
+        _last_path_request_ts[path_key] = now2
+
+
+def _diag_headers(resp) -> str:
+    """Pull out the headers that would reveal a WAF/bot-management product
+    fronting this endpoint (Akamai, Cloudflare, custom rate-limiter, etc.),
+    so a timeout/small-payload log line carries actual diagnostic evidence
+    instead of just a guess. Logged at DBG level on every response."""
+    try:
+        h = resp.headers
+    except Exception:
+        return "(no headers available)"
+    interesting = [
+        "Server", "Via", "X-Cache", "X-Akamai-Transformed", "X-Akamai-Request-ID",
+        "cf-ray", "cf-cache-status", "X-RateLimit-Limit", "X-RateLimit-Remaining",
+        "X-RateLimit-Reset", "Retry-After", "X-Request-ID", "X-Frame-Options",
+    ]
+    found = {k: h[k] for k in interesting if k in h}
+    cookies = list(getattr(resp, "cookies", {}) or {})
+    return f"headers={found or '(none of interest)'} cookies_set={cookies}"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -371,7 +433,8 @@ def _extract_json_from_binary(raw_bytes: bytes):
 
 
 def _nse_json(sess, url: str, params=None, timeout: int = 25, referer: str = None,
-              _retry: int = 2, min_bytes: int = 0, session_factory=None, _rounds: int = 2):
+              _retry: int = 2, min_bytes: int = 0, session_factory=None, _rounds: int = 2,
+              path_key: str = None, section_warmup: str = None):
     """
     GET a NSE endpoint and return parsed JSON.
     Raises ValueError with FULL context on any failure.
@@ -391,6 +454,18 @@ def _nse_json(sess, url: str, params=None, timeout: int = 25, referer: str = Non
     blocked" even if it's technically valid JSON (e.g. NSE sometimes returns a
     trivial `{}`/`[]`/error stub under bot detection instead of a real 403).
     Leave at 0 for endpoints where a small-but-real response is normal.
+
+    `path_key`: identifies the URL path for per-path throttling (see
+    _PATH_THROTTLE_GAP_SEC). Auto-derived from `url` if not given.
+
+    `section_warmup`: an optional NSE *section page* URL (e.g. the actual
+    companies-listing page a browser would visit before calling this API)
+    to hit once at the start of each round, on the current session, before
+    the real API call. The existing session warmup only visits the
+    homepage + the market-data page — never the section page the referer
+    header claims to come from — so this fills that gap cheaply for the
+    endpoints where it matters, in case NSE ties a cookie to having
+    actually visited that section.
     """
     req_headers = {}
     if referer:
@@ -400,15 +475,28 @@ def _nse_json(sess, url: str, params=None, timeout: int = 25, referer: str = Non
     short_url = url.replace('https://www.nseindia.com', '').replace('https://nsearchives.nseindia.com', '[arch]')[:80]
     log(f"NSE GET {short_url}", "DBG")
 
+    if path_key is None:
+        path_key = short_url.split("?")[0]
+
     current_sess = sess
     last_err: Exception = ValueError(f"NSE {url}: no attempts were made")
 
     for round_num in range(1, _rounds + 1):
         round_failed = False
 
+        if section_warmup:
+            try:
+                _throttle(path_key)
+                wr = current_sess.get(section_warmup, timeout=timeout)
+                log(f"NSE section warmup {section_warmup[-45:]} → HTTP {wr.status_code} "
+                    f"({len(wr.content)}B) | {_diag_headers(wr)}", "DBG")
+                time.sleep(1.0)
+            except Exception as exc:
+                log(f"NSE section warmup failed for {section_warmup}: {exc} — continuing anyway", "WARN")
+
         for attempt in range(1, _retry + 1):
             try:
-                _throttle()
+                _throttle(path_key)
                 resp = current_sess.get(url, params=params, timeout=timeout, headers=req_headers)
             except _TIMEOUT_EXCS:
                 if attempt < _retry:
@@ -435,7 +523,7 @@ def _nse_json(sess, url: str, params=None, timeout: int = 25, referer: str = Non
 
             raw = resp.content
             log(f"NSE response: HTTP {resp.status_code}, {len(raw)} bytes "
-                f"(round {round_num}/{_rounds}, attempt {attempt}/{_retry})", "DBG")
+                f"(round {round_num}/{_rounds}, attempt {attempt}/{_retry}) | {_diag_headers(resp)}", "DBG")
 
             if resp.status_code in (429, 502, 503) and attempt < _retry:
                 wait = 6 * attempt
@@ -886,7 +974,9 @@ def fetch_insider(days_back: int = 30, max_days_per_request: int = 14, sess=None
             data = _nse_json(sess, "https://www.nseindia.com/api/corporates-pit",
                              params={"index":"equities","from_date":from_dt,"to_date":to_dt},
                              referer="https://www.nseindia.com/companies-listing/corporate-filings-pit",
-                             timeout=25, min_bytes=20, session_factory=nse_session)
+                             section_warmup="https://www.nseindia.com/companies-listing/corporate-filings-pit",
+                             timeout=25, min_bytes=20, session_factory=nse_session,
+                             path_key="/api/corporates-pit")
         except Exception as exc:
             log_tb(f"Insider chunk {i}/{len(chunks)} ({from_dt} → {to_dt}) failed", exc)
             chunk_failures.append(f"{from_dt}→{to_dt}: {exc}")
@@ -1075,14 +1165,19 @@ def fetch_insider(days_back: int = 30, max_days_per_request: int = 14, sess=None
 
 def fetch_filings(days_back: int = 14, sess=None):
     sess = sess or nse_session()
-    from_dt = (datetime.today() - timedelta(days=days_back)).strftime("%d-%m-%Y")
-    to_dt   = datetime.today().strftime("%d-%m-%Y")
+    # IST, not UTC — GitHub Actions runners are UTC and datetime.today() would
+    # give the wrong calendar date near midnight IST (see fetch_insider).
+    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    from_dt = (now_ist - timedelta(days=days_back)).strftime("%d-%m-%Y")
+    to_dt   = now_ist.strftime("%d-%m-%Y")
     log(f"Filings: fetching {from_dt} → {to_dt}")
 
     data = _nse_json(sess, "https://www.nseindia.com/api/corporate-announcements",
                      params={"index":"equities","from_date":from_dt,"to_date":to_dt},
                      referer="https://www.nseindia.com/companies-listing/corporate-filings-announcements",
-                     timeout=25, session_factory=nse_session)
+                     section_warmup="https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+                     timeout=25, session_factory=nse_session,
+                     path_key="/api/corporate-announcements")
 
     rows = data.get("data",[]) if isinstance(data,dict) else (data or [])
     log(f"Filings API: {len(rows)} raw rows")
@@ -1265,33 +1360,17 @@ def main():
     log("\n🔧 Warming shared NSE session for this run...")
     shared_sess = nse_session()
 
-    # ── 1. BHAVCOPY ──────────────────────────────────────────────────
-    log("\n" + "─" * 45)
-    log("📥 [1/5] Bhavcopy")
-    try:
-        df   = fetch_bhavcopy(date_str, sess=shared_sess)
-        rows = push_df(client, SHEET_BHAVCOPY, df)
-        log(f"{rows} rows → '{SHEET_BHAVCOPY}'", "OK")
-        results["BHAVCOPY"] = f"✅ {rows} rows"
-    except Exception as exc:
-        log_tb("Bhavcopy FAILED", exc)
-        results["BHAVCOPY"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
+    # ── Ordering note ──────────────────────────────────────────────────
+    # Insider and Filings hit corporates-pit / corporate-announcements —
+    # the two endpoints that actually time out. They now run FIRST, right
+    # after the shared warmup, so they get the freshest session and the
+    # least prior NSE traffic in this run, before Bhavcopy/FII-DII/Earnings
+    # (which have never failed) spend any of the run's request budget or
+    # trip any volume-based throttling ahead of them.
 
-    # ── 2. FII/DII ───────────────────────────────────────────────────
+    # ── 1. INSIDER ───────────────────────────────────────────────────
     log("\n" + "─" * 45)
-    log("📥 [2/5] FII/DII")
-    try:
-        df, fii_cr, dii_cr = fetch_fii_dii(sess=shared_sess)
-        rows = push_df(client, SHEET_FII_DII, df)
-        log(f"FII ₹{fii_cr:+.2f}Cr | DII ₹{dii_cr:+.2f}Cr → {rows} rows", "OK")
-        results["FII_DII"] = f"✅ FII ₹{fii_cr:+.2f}Cr | DII ₹{dii_cr:+.2f}Cr"
-    except Exception as exc:
-        log_tb("FII/DII FAILED", exc)
-        results["FII_DII"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
-
-    # ── 3. INSIDER ───────────────────────────────────────────────────
-    log("\n" + "─" * 45)
-    log("📥 [3/5] Insider trades")
+    log("📥 [1/5] Insider trades")
     try:
         df, count = fetch_insider(sess=shared_sess)
         rows = push_df(client, SHEET_INSIDER, df)
@@ -1301,9 +1380,9 @@ def main():
         log_tb("Insider FAILED", exc)
         results["INSIDER"] = f"⚠️ {type(exc).__name__}: {str(exc)[:150]}"
 
-    # ── 4. FILINGS ───────────────────────────────────────────────────
+    # ── 2. FILINGS ───────────────────────────────────────────────────
     log("\n" + "─" * 45)
-    log("📥 [4/5] Filings")
+    log("📥 [2/5] Filings")
     try:
         df, count = fetch_filings(sess=shared_sess)
         rows = push_df(client, SHEET_FILINGS, df)
@@ -1312,6 +1391,30 @@ def main():
     except Exception as exc:
         log_tb("Filings FAILED", exc)
         results["FILINGS"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
+
+    # ── 3. BHAVCOPY ──────────────────────────────────────────────────
+    log("\n" + "─" * 45)
+    log("📥 [3/5] Bhavcopy")
+    try:
+        df   = fetch_bhavcopy(date_str, sess=shared_sess)
+        rows = push_df(client, SHEET_BHAVCOPY, df)
+        log(f"{rows} rows → '{SHEET_BHAVCOPY}'", "OK")
+        results["BHAVCOPY"] = f"✅ {rows} rows"
+    except Exception as exc:
+        log_tb("Bhavcopy FAILED", exc)
+        results["BHAVCOPY"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
+
+    # ── 4. FII/DII ───────────────────────────────────────────────────
+    log("\n" + "─" * 45)
+    log("📥 [4/5] FII/DII")
+    try:
+        df, fii_cr, dii_cr = fetch_fii_dii(sess=shared_sess)
+        rows = push_df(client, SHEET_FII_DII, df)
+        log(f"FII ₹{fii_cr:+.2f}Cr | DII ₹{dii_cr:+.2f}Cr → {rows} rows", "OK")
+        results["FII_DII"] = f"✅ FII ₹{fii_cr:+.2f}Cr | DII ₹{dii_cr:+.2f}Cr"
+    except Exception as exc:
+        log_tb("FII/DII FAILED", exc)
+        results["FII_DII"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
 
     # ── 5. EARNINGS ──────────────────────────────────────────────────
     log("\n" + "─" * 45)
