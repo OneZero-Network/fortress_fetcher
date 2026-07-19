@@ -129,6 +129,25 @@ def _next_fingerprint():
         return "curl_cffi", NSE_IMPERSONATE_PROFILES[i % len(NSE_IMPERSONATE_PROFILES)]
     return "requests", _PLAIN_HEADER_SETS[i % len(_PLAIN_HEADER_SETS)]
 
+# ── Global cross-call throttle ───────────────────────────────────────
+# NSE appears to rate-limit / tarpit based on request VOLUME from an IP over
+# a short window, not just per-endpoint. Observed across two runs: whichever
+# endpoint happened to fire during a burst is the one that stalls (Insider
+# one run, Filings the next) — not always the same one. Every fetch_*()
+# creating its own session (2 warmup hits each) plus per-chunk rotations
+# adds up to a burst of 10+ requests in a couple of minutes. This enforces a
+# minimum gap between ANY request this script sends to nseindia.com,
+# regardless of which function is calling.
+_MIN_REQUEST_GAP_SEC = 2.5
+_last_request_ts = {"t": 0.0}
+
+def _throttle():
+    now = time.time()
+    wait = _last_request_ts["t"] + _MIN_REQUEST_GAP_SEC - now
+    if wait > 0:
+        time.sleep(wait)
+    _last_request_ts["t"] = time.time()
+
 
 # ══════════════════════════════════════════════════════════════════════
 # CONFIG — all from environment variables / GitHub Secrets
@@ -307,6 +326,7 @@ def nse_session(timeout: int = 30):
     for url in ["https://www.nseindia.com",
                 "https://www.nseindia.com/market-data/live-equity-market"]:
         try:
+            _throttle()
             r = s.get(url, timeout=timeout)
             log(f"NSE warmup {url[-35:]} → HTTP {r.status_code} ({len(r.content)}B)", "DBG")
             time.sleep(1.5)
@@ -350,8 +370,8 @@ def _extract_json_from_binary(raw_bytes: bytes):
     )
 
 
-def _nse_json(sess, url: str, params=None, timeout: int = 30, referer: str = None,
-              _retry: int = 3, min_bytes: int = 0, session_factory=None, _rounds: int = 2):
+def _nse_json(sess, url: str, params=None, timeout: int = 25, referer: str = None,
+              _retry: int = 2, min_bytes: int = 0, session_factory=None, _rounds: int = 2):
     """
     GET a NSE endpoint and return parsed JSON.
     Raises ValueError with FULL context on any failure.
@@ -388,6 +408,7 @@ def _nse_json(sess, url: str, params=None, timeout: int = 30, referer: str = Non
 
         for attempt in range(1, _retry + 1):
             try:
+                _throttle()
                 resp = current_sess.get(url, params=params, timeout=timeout, headers=req_headers)
             except _TIMEOUT_EXCS:
                 if attempt < _retry:
@@ -597,8 +618,8 @@ def _download_bhavcopy_file(date_str: str, warmed_sess: requests.Session = None)
     )
 
 
-def _download_bhavcopy_api() -> pd.DataFrame:
-    sess = nse_session()
+def _download_bhavcopy_api(sess=None) -> pd.DataFrame:
+    sess = sess or nse_session()
     indices = [
         ("NIFTY%20TOTAL%20MARKET",    "NIFTY TOTAL MARKET"),
         ("NIFTY%20500",               "NIFTY 500"),
@@ -713,14 +734,14 @@ def clean_bhavcopy(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def fetch_bhavcopy(date_str: str) -> pd.DataFrame:
-    sess = nse_session()          # warm once, reuse for both file download and API fallback
+def fetch_bhavcopy(date_str: str, sess=None) -> pd.DataFrame:
+    sess = sess or nse_session()  # reuse the run-wide session if given, else warm one
     try:
         return clean_bhavcopy(_download_bhavcopy_file(date_str, warmed_sess=sess))
     except Exception as exc:
         log_tb("Bhavcopy file download/parse failed — switching to live API fallback", exc)
         log("🔄 Live API fallback starting...")
-        return _download_bhavcopy_api()
+        return _download_bhavcopy_api(sess=sess)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -747,8 +768,8 @@ def _first_key(d: dict, keys: list, label: str = ""):
         log(f"  {label}: NONE of {keys} found. Row has keys: {list(d.keys())}", "WARN")
     return None
 
-def fetch_fii_dii():
-    sess = nse_session()
+def fetch_fii_dii(sess=None):
+    sess = sess or nse_session()
     data = _nse_json(sess, "https://www.nseindia.com/api/fiidiiTradeReact",
                      referer="https://www.nseindia.com/report-detail/eq_fii_dii",
                      timeout=30, session_factory=nse_session)
@@ -826,8 +847,8 @@ def fetch_fii_dii():
 # INSIDER TRADES
 # ══════════════════════════════════════════════════════════════════════
 
-def fetch_insider(days_back: int = 30, max_days_per_request: int = 14):
-    sess = nse_session()
+def fetch_insider(days_back: int = 30, max_days_per_request: int = 14, sess=None):
+    sess = sess or nse_session()
     # Always use IST — GitHub Actions runners use UTC; datetime.today() gives wrong date
     now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     full_from = now_ist - timedelta(days=days_back)
@@ -865,7 +886,7 @@ def fetch_insider(days_back: int = 30, max_days_per_request: int = 14):
             data = _nse_json(sess, "https://www.nseindia.com/api/corporates-pit",
                              params={"index":"equities","from_date":from_dt,"to_date":to_dt},
                              referer="https://www.nseindia.com/companies-listing/corporate-filings-pit",
-                             timeout=45, min_bytes=20, session_factory=nse_session)
+                             timeout=25, min_bytes=20, session_factory=nse_session)
         except Exception as exc:
             log_tb(f"Insider chunk {i}/{len(chunks)} ({from_dt} → {to_dt}) failed", exc)
             chunk_failures.append(f"{from_dt}→{to_dt}: {exc}")
@@ -1052,8 +1073,8 @@ def fetch_insider(days_back: int = 30, max_days_per_request: int = 14):
 # FILINGS
 # ══════════════════════════════════════════════════════════════════════
 
-def fetch_filings(days_back: int = 14):
-    sess = nse_session()
+def fetch_filings(days_back: int = 14, sess=None):
+    sess = sess or nse_session()
     from_dt = (datetime.today() - timedelta(days=days_back)).strftime("%d-%m-%Y")
     to_dt   = datetime.today().strftime("%d-%m-%Y")
     log(f"Filings: fetching {from_dt} → {to_dt}")
@@ -1061,7 +1082,7 @@ def fetch_filings(days_back: int = 14):
     data = _nse_json(sess, "https://www.nseindia.com/api/corporate-announcements",
                      params={"index":"equities","from_date":from_dt,"to_date":to_dt},
                      referer="https://www.nseindia.com/companies-listing/corporate-filings-announcements",
-                     timeout=45, session_factory=nse_session)
+                     timeout=25, session_factory=nse_session)
 
     rows = data.get("data",[]) if isinstance(data,dict) else (data or [])
     log(f"Filings API: {len(rows)} raw rows")
@@ -1097,8 +1118,8 @@ def fetch_filings(days_back: int = 14):
 # EARNINGS CALENDAR
 # ══════════════════════════════════════════════════════════════════════
 
-def fetch_earnings():
-    sess = nse_session()
+def fetch_earnings(sess=None):
+    sess = sess or nse_session()
     data = _nse_json(sess, "https://www.nseindia.com/api/event-calendar",
                      params={"index":"equities"},
                      referer="https://www.nseindia.com/companies-listing/corporate-filings",
@@ -1231,11 +1252,24 @@ def main():
     results = {}
     fii_cr = dii_cr = None
 
+    # ── Warm ONE session for the whole run ────────────────────────────
+    # Each fetch_*() used to call nse_session() independently — 2 warmup
+    # requests apiece, plus more per Insider chunk — bursting 10+ extra
+    # requests at nseindia.com in a couple of minutes. NSE's rate-limiting
+    # looks volume-based rather than tied to one specific endpoint (different
+    # runs have seen different stages stall), so cutting total request count
+    # is the fix that matters most. Individual stages still get a fresh,
+    # differently-fingerprinted session automatically if their own request
+    # fails (via session_factory=nse_session inside _nse_json) — this only
+    # removes the *proactive* re-warming that was happening on every call.
+    log("\n🔧 Warming shared NSE session for this run...")
+    shared_sess = nse_session()
+
     # ── 1. BHAVCOPY ──────────────────────────────────────────────────
     log("\n" + "─" * 45)
     log("📥 [1/5] Bhavcopy")
     try:
-        df   = fetch_bhavcopy(date_str)
+        df   = fetch_bhavcopy(date_str, sess=shared_sess)
         rows = push_df(client, SHEET_BHAVCOPY, df)
         log(f"{rows} rows → '{SHEET_BHAVCOPY}'", "OK")
         results["BHAVCOPY"] = f"✅ {rows} rows"
@@ -1247,7 +1281,7 @@ def main():
     log("\n" + "─" * 45)
     log("📥 [2/5] FII/DII")
     try:
-        df, fii_cr, dii_cr = fetch_fii_dii()
+        df, fii_cr, dii_cr = fetch_fii_dii(sess=shared_sess)
         rows = push_df(client, SHEET_FII_DII, df)
         log(f"FII ₹{fii_cr:+.2f}Cr | DII ₹{dii_cr:+.2f}Cr → {rows} rows", "OK")
         results["FII_DII"] = f"✅ FII ₹{fii_cr:+.2f}Cr | DII ₹{dii_cr:+.2f}Cr"
@@ -1259,7 +1293,7 @@ def main():
     log("\n" + "─" * 45)
     log("📥 [3/5] Insider trades")
     try:
-        df, count = fetch_insider()
+        df, count = fetch_insider(sess=shared_sess)
         rows = push_df(client, SHEET_INSIDER, df)
         log(f"{count} transactions → '{SHEET_INSIDER}'", "OK")
         results["INSIDER"] = f"✅ {count} buy transactions"
@@ -1271,7 +1305,7 @@ def main():
     log("\n" + "─" * 45)
     log("📥 [4/5] Filings")
     try:
-        df, count = fetch_filings()
+        df, count = fetch_filings(sess=shared_sess)
         rows = push_df(client, SHEET_FILINGS, df)
         log(f"{count} filings → '{SHEET_FILINGS}'", "OK")
         results["FILINGS"] = f"✅ {count} filings"
@@ -1283,7 +1317,7 @@ def main():
     log("\n" + "─" * 45)
     log("📥 [5/5] Earnings")
     try:
-        df, count = fetch_earnings()
+        df, count = fetch_earnings(sess=shared_sess)
         rows = push_df(client, SHEET_EARNINGS, df)
         log(f"{count} events → '{SHEET_EARNINGS}'", "OK")
         results["EARNINGS"] = f"✅ {count} events"
