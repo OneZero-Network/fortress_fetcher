@@ -32,6 +32,11 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install requests pandas gspread google-auth
+          # curl_cffi impersonates a real browser TLS/JA3 fingerprint — NSE's
+          # bot-management started tarpitting/blocking plain `requests` sessions
+          # in mid-2026. The script falls back to plain requests automatically
+          # if this install ever fails, so it's safe even if the wheel breaks.
+          pip install curl_cffi || echo "curl_cffi install failed — will fall back to plain requests"
 
       - name: Run Fortress Fetcher
         env:
