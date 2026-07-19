@@ -826,26 +826,85 @@ def fetch_fii_dii():
 # INSIDER TRADES
 # ══════════════════════════════════════════════════════════════════════
 
-def fetch_insider(days_back: int = 30):
+def fetch_insider(days_back: int = 30, max_days_per_request: int = 14):
     sess = nse_session()
     # Always use IST — GitHub Actions runners use UTC; datetime.today() gives wrong date
     now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    from_dt = (now_ist - timedelta(days=days_back)).strftime("%d-%m-%Y")
-    to_dt   = now_ist.strftime("%d-%m-%Y")
-    log(f"Insider: fetching {from_dt} → {to_dt} (IST: {now_ist.strftime('%Y-%m-%d %H:%M')})")
+    full_from = now_ist - timedelta(days=days_back)
+    full_to   = now_ist
 
-    data = _nse_json(sess, "https://www.nseindia.com/api/corporates-pit",
-                     params={"index":"equities","from_date":from_dt,"to_date":to_dt},
-                     referer="https://www.nseindia.com/companies-listing/corporate-filings-pit",
-                     timeout=45, session_factory=nse_session)
+    # ── Chunked fetch ────────────────────────────────────────────────
+    # NSE's corporates-pit endpoint appears to silently return 0 rows when
+    # the from_date→to_date span is too wide (observed: 30-day request → 0
+    # rows, while the sibling corporate-announcements endpoint's 14-day
+    # request on the same run returned 7198 rows — same session, same
+    # params shape, only the date span differs). Rather than erroring, NSE
+    # just hands back an empty array, so this never looked like a block to
+    # the retry logic. Splitting into <=max_days_per_request windows works
+    # around that cap regardless of whether it's a hard NSE limit or a
+    # bot-detection soft-block tied to wide-range requests specifically.
+    chunks = []
+    chunk_end = full_to
+    while chunk_end > full_from:
+        chunk_start = max(full_from, chunk_end - timedelta(days=max_days_per_request))
+        chunks.append((chunk_start, chunk_end))
+        chunk_end = chunk_start
 
-    rows = data.get("data",[]) if isinstance(data,dict) else (data or [])
-    log(f"Insider API: {len(rows)} raw rows returned")
+    log(f"Insider: fetching {full_from.strftime('%d-%m-%Y')} → {full_to.strftime('%d-%m-%Y')} "
+        f"in {len(chunks)} chunk(s) of <={max_days_per_request}d (IST: {now_ist.strftime('%Y-%m-%d %H:%M')})")
+
+    rows: list = []
+    seen_keys: set = set()
+    chunk_failures = []
+
+    for i, (c_from, c_to) in enumerate(chunks, 1):
+        from_dt = c_from.strftime("%d-%m-%Y")
+        to_dt   = c_to.strftime("%d-%m-%Y")
+        log(f"Insider chunk {i}/{len(chunks)}: {from_dt} → {to_dt}", "DBG")
+        try:
+            data = _nse_json(sess, "https://www.nseindia.com/api/corporates-pit",
+                             params={"index":"equities","from_date":from_dt,"to_date":to_dt},
+                             referer="https://www.nseindia.com/companies-listing/corporate-filings-pit",
+                             timeout=45, min_bytes=20, session_factory=nse_session)
+        except Exception as exc:
+            log_tb(f"Insider chunk {i}/{len(chunks)} ({from_dt} → {to_dt}) failed", exc)
+            chunk_failures.append(f"{from_dt}→{to_dt}: {exc}")
+            continue
+
+        chunk_rows = data.get("data", []) if isinstance(data, dict) else (data or [])
+        log(f"Insider chunk {i}/{len(chunks)}: {len(chunk_rows)} raw rows", "DBG")
+
+        new_in_chunk = 0
+        for r in chunk_rows:
+            # De-dupe across chunk boundaries (a trade filed right at a
+            # chunk edge could show up in two adjacent windows).
+            dedupe_key = (
+                str(r.get("symbol", r.get("Symbol", r.get("SYMBOL", "")))),
+                str(r.get("intimDt", r.get("broadcastDt", r.get("date", "")))),
+                str(r.get("acqfromDt", r.get("acqFromDt", ""))),
+                str(r.get("totAcqShrs", r.get("secAcq", r.get("noOfShares", "")))),
+                str(r.get("acqName", r.get("acquirerName", r.get("name", "")))),
+            )
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+            rows.append(r)
+            new_in_chunk += 1
+        log(f"Insider chunk {i}/{len(chunks)}: +{new_in_chunk} new (total so far: {len(rows)})", "DBG")
+
+        if i < len(chunks):
+            time.sleep(1.0)
+
+    log(f"Insider API: {len(rows)} raw rows returned across {len(chunks)} chunk(s)"
+        + (f" ({len(chunk_failures)} chunk(s) failed)" if chunk_failures else ""))
     if rows:
         log(f"Insider row[0] keys: {list(rows[0].keys())}", "DBG")
         log(f"Insider row[0] sample: {dict(list(rows[0].items())[:8])}", "DBG")
+    elif chunk_failures:
+        log(f"Insider: ALL chunks returned 0 rows or failed. Failures: {chunk_failures}", "WARN")
     else:
-        log("Insider API returned 0 rows — check if the date range params are accepted", "WARN")
+        log("Insider API returned 0 rows across every chunk — genuinely no insider "
+            "filings in this window, or NSE is soft-blocking this endpoint entirely", "WARN")
 
     SYM_KEYS    = ["symbol","Symbol","SYMBOL","scripCode"]
     MODE_KEYS   = ["acqMode","acqmode","transactionType","acquisitionMode","tdpTransactionType"]
