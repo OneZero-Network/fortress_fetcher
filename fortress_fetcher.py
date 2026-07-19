@@ -56,6 +56,79 @@ except ImportError as e:
     print("Run: pip install requests pandas gspread google-auth", flush=True)
     sys.exit(1)
 
+# ── Optional: curl_cffi gives us a real browser TLS/JA3 fingerprint.
+# NSE's bot-management started tarpitting/blocking plain `requests` sessions
+# (distinguishable purely at the TLS handshake level, regardless of headers).
+# If curl_cffi isn't installed we transparently fall back to plain `requests`
+# with rotated header sets — degraded, but the script still runs.
+try:
+    from curl_cffi import requests as cf_requests
+    from curl_cffi.requests.exceptions import (
+        Timeout as _CfTimeout,
+        ConnectionError as _CfConnectionError,
+        RequestException as _CfRequestException,
+    )
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+    cf_requests = None
+    _CfTimeout = _CfConnectionError = _CfRequestException = ()
+
+# Unified exception tuples so every except-clause below catches failures from
+# EITHER backend (plain requests or curl_cffi), whichever is active.
+_TIMEOUT_EXCS = (requests.exceptions.Timeout,) + ((_CfTimeout,) if HAS_CURL_CFFI else ())
+_CONN_EXCS    = (requests.exceptions.ConnectionError,) + ((_CfConnectionError,) if HAS_CURL_CFFI else ())
+_REQ_EXCS     = (requests.exceptions.RequestException,) + ((_CfRequestException,) if HAS_CURL_CFFI else ())
+
+# Rotation pool of browser fingerprints to impersonate (curl_cffi) — cycled
+# across session creations so a block/tarpit on one fingerprint doesn't sink
+# every fetch in the run. Mix of Chrome/Edge/Firefox/Safari, all recent.
+NSE_IMPERSONATE_PROFILES = [
+    "chrome146", "chrome142", "chrome136", "edge101", "safari184", "firefox147",
+]
+
+# Rotation pool of plain-requests header sets, used only when curl_cffi is
+# unavailable. Varies UA, sec-ch-ua, and Accept-Encoding together so each
+# session at least looks like a *consistent* browser rather than a mix.
+_PLAIN_HEADER_SETS = [
+    {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Accept-Encoding": "gzip, deflate, br",
+    },
+    {
+        "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+                       "(KHTML, like Gecko) Version/17.4 Safari/605.1.15"),
+        "sec-ch-ua-platform": '"macOS"',
+        "Accept-Encoding": "gzip, deflate, br",
+    },
+    {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"),
+        "sec-ch-ua": '"Microsoft Edge";v="126", "Chromium";v="126", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "Accept-Encoding": "gzip, deflate, br",
+    },
+    {
+        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0"),
+        "Accept-Encoding": "gzip, deflate, br",
+    },
+]
+
+_session_rotation = {"n": 0}
+
+def _next_fingerprint():
+    """Returns (backend_label, profile_or_headers) and advances the rotation counter."""
+    i = _session_rotation["n"]
+    _session_rotation["n"] += 1
+    if HAS_CURL_CFFI:
+        return "curl_cffi", NSE_IMPERSONATE_PROFILES[i % len(NSE_IMPERSONATE_PROFILES)]
+    return "requests", _PLAIN_HEADER_SETS[i % len(_PLAIN_HEADER_SETS)]
+
 
 # ══════════════════════════════════════════════════════════════════════
 # CONFIG — all from environment variables / GitHub Secrets
@@ -198,31 +271,48 @@ def send_telegram(text: str):
 # NSE SESSION
 # ══════════════════════════════════════════════════════════════════════
 
-def nse_session() -> requests.Session:
+def nse_session(timeout: int = 30):
     """
-    Warmed-up requests Session for NSE.
+    Warmed-up session for NSE — curl_cffi (real browser TLS/JA3 fingerprint)
+    when available, else plain requests with rotated browser-like headers.
+
+    Each call advances the fingerprint rotation, so successive fetch_*()
+    calls in the same run each get a different "browser" — if NSE's bot
+    management is tarpitting one fingerprint, the next call gets a fresh one
+    instead of repeating the same failure all run.
+
     Warmup failures are LOGGED (with status code) but never abort the run —
     the session is still returned so the actual API calls can try.
     """
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent":      ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/124.0.0.0 Safari/537.36"),
+    backend, fp = _next_fingerprint()
+
+    common_headers = {
         "Accept":          "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
         "DNT":             "1",
         "Connection":      "keep-alive",
-    })
+    }
+
+    if backend == "curl_cffi":
+        s = cf_requests.Session(impersonate=fp)
+        s.headers.update(common_headers)
+        log(f"NSE session: curl_cffi impersonate={fp}", "DBG")
+    else:
+        s = requests.Session()
+        s.headers.update(common_headers)
+        s.headers.update(fp)
+        log("NSE session: plain requests fallback (pip install curl_cffi for a real "
+            "browser TLS fingerprint — recommended, NSE bot-detection tightened)", "WARN")
+
     for url in ["https://www.nseindia.com",
                 "https://www.nseindia.com/market-data/live-equity-market"]:
         try:
-            r = s.get(url, timeout=15)
+            r = s.get(url, timeout=timeout)
             log(f"NSE warmup {url[-35:]} → HTTP {r.status_code} ({len(r.content)}B)", "DBG")
             time.sleep(1.5)
-        except requests.exceptions.Timeout:
+        except _TIMEOUT_EXCS:
             log(f"NSE warmup TIMEOUT for {url} — continuing anyway", "WARN")
-        except requests.exceptions.ConnectionError as exc:
+        except _CONN_EXCS as exc:
             log(f"NSE warmup CONNECTION ERROR for {url}: {exc} — continuing anyway", "WARN")
         except Exception as exc:
             log_tb(f"NSE warmup unexpected error for {url}", exc)
@@ -260,70 +350,141 @@ def _extract_json_from_binary(raw_bytes: bytes):
     )
 
 
-def _nse_json(sess, url: str, params=None, timeout: int = 20, referer: str = None, _retry: int = 3):
+def _nse_json(sess, url: str, params=None, timeout: int = 30, referer: str = None,
+              _retry: int = 3, min_bytes: int = 0, session_factory=None, _rounds: int = 2):
     """
     GET a NSE endpoint and return parsed JSON.
     Raises ValueError with FULL context on any failure.
-    Retries up to _retry times on 429 (rate-limit) or 502/503 (gateway errors).
+
+    Two layers of resilience:
+      1. Within a "round": retries up to _retry times on timeout / 429 / 502/503,
+         with growing backoff (same session/fingerprint — handles transient
+         rate-limiting).
+      2. Across "rounds": if a whole round fails (exhausted retries, empty body,
+         HTML-instead-of-JSON, or a suspiciously small payload under `min_bytes`),
+         and `session_factory` was given, get a BRAND NEW session — a different
+         browser fingerprint / header set via the rotation pool — and try again.
+         This is what actually gets past a tarpit/block tied to one fingerprint,
+         as opposed to just re-hitting the same wall harder.
+
+    `min_bytes`: if set, a response smaller than this is treated as "likely
+    blocked" even if it's technically valid JSON (e.g. NSE sometimes returns a
+    trivial `{}`/`[]`/error stub under bot detection instead of a real 403).
+    Leave at 0 for endpoints where a small-but-real response is normal.
     """
     req_headers = {}
     if referer:
         req_headers["Referer"]          = referer
         req_headers["X-Requested-With"] = "XMLHttpRequest"
 
-    log(f"NSE GET {url.replace('https://www.nseindia.com','').replace('https://nsearchives.nseindia.com','[arch]')[:80]}", "DBG")
+    short_url = url.replace('https://www.nseindia.com', '').replace('https://nsearchives.nseindia.com', '[arch]')[:80]
+    log(f"NSE GET {short_url}", "DBG")
 
-    for attempt in range(1, _retry + 1):
-        try:
-            resp = sess.get(url, params=params, timeout=timeout, headers=req_headers)
-        except requests.exceptions.Timeout:
-            if attempt < _retry:
-                wait = 8 * attempt
-                log(f"TIMEOUT — backing off {wait}s before retry {attempt}/{_retry - 1}...", "WARN")
+    current_sess = sess
+    last_err: Exception = ValueError(f"NSE {url}: no attempts were made")
+
+    for round_num in range(1, _rounds + 1):
+        round_failed = False
+
+        for attempt in range(1, _retry + 1):
+            try:
+                resp = current_sess.get(url, params=params, timeout=timeout, headers=req_headers)
+            except _TIMEOUT_EXCS:
+                if attempt < _retry:
+                    wait = 8 * attempt
+                    log(f"TIMEOUT — backing off {wait}s before retry {attempt}/{_retry - 1} "
+                        f"(round {round_num}/{_rounds})...", "WARN")
+                    time.sleep(wait)
+                    continue
+                last_err = ValueError(f"NSE request timed out after {timeout}s\n  URL: {url}")
+                round_failed = True
+                break
+            except _CONN_EXCS as exc:
+                last_err = ValueError(f"NSE connection error: {exc}\n  URL: {url}")
+                round_failed = True
+                break
+            except _REQ_EXCS as exc:
+                last_err = ValueError(f"NSE request failed ({type(exc).__name__}): {exc}\n  URL: {url}")
+                round_failed = True
+                break
+            except Exception as exc:
+                last_err = ValueError(f"NSE request failed ({type(exc).__name__}): {exc}\n  URL: {url}")
+                round_failed = True
+                break
+
+            raw = resp.content
+            log(f"NSE response: HTTP {resp.status_code}, {len(raw)} bytes "
+                f"(round {round_num}/{_rounds}, attempt {attempt}/{_retry})", "DBG")
+
+            if resp.status_code in (429, 502, 503) and attempt < _retry:
+                wait = 6 * attempt
+                log(f"HTTP {resp.status_code} — backing off {wait}s before retry "
+                    f"{attempt}/{_retry - 1}...", "WARN")
                 time.sleep(wait)
                 continue
-            raise ValueError(f"NSE request timed out after {timeout}s\n  URL: {url}")
-        except requests.exceptions.ConnectionError as exc:
-            raise ValueError(f"NSE connection error: {exc}\n  URL: {url}")
-        except Exception as exc:
-            raise ValueError(f"NSE request failed ({type(exc).__name__}): {exc}\n  URL: {url}")
 
-        raw = resp.content
-        log(f"NSE response: HTTP {resp.status_code}, {len(raw)} bytes", "DBG")
+            if not raw or len(raw) < 10:
+                last_err = ValueError(
+                    f"NSE returned EMPTY body (HTTP {resp.status_code})\n"
+                    f"  URL: {url}\n"
+                    f"  This usually means NSE blocked the request or the endpoint changed."
+                )
+                round_failed = True
+                break
 
-        if resp.status_code in (429, 502, 503) and attempt < _retry:
-            wait = 6 * attempt
-            log(f"HTTP {resp.status_code} — backing off {wait}s before retry {attempt}/{_retry - 1}...", "WARN")
-            time.sleep(wait)
+            # lstrip() handles NSE padding raw HTML with spaces/newlines before <!DOCTYPE
+            raw_stripped = raw.lstrip()
+            if raw_stripped[:1] == b"<" or raw_stripped[:9].lower() == b"<!doctype":
+                preview = raw[:400].decode("utf-8", errors="ignore")
+                last_err = ValueError(
+                    f"NSE returned HTML instead of JSON (HTTP {resp.status_code})\n"
+                    f"  URL: {url}\n"
+                    f"  Cause: NSE rate-limit / IP block / endpoint moved\n"
+                    f"  HTML preview: {preview[:250]}"
+                )
+                round_failed = True
+                break
+
+            if min_bytes and len(raw) < min_bytes:
+                log(f"Response suspiciously small ({len(raw)}B < {min_bytes}B expected for "
+                    f"this endpoint) — treating as a soft block", "WARN")
+                last_err = ValueError(
+                    f"NSE returned a suspiciously small payload ({len(raw)}B, HTTP "
+                    f"{resp.status_code})\n  URL: {url}\n"
+                    f"  Cause: likely bot-detection returning a stub instead of real data"
+                )
+                round_failed = True
+                break
+
+            try:
+                return resp.json()
+            except Exception:
+                pass
+
+            log("Standard JSON decode failed — attempting binary extraction", "WARN")
+            try:
+                return _extract_json_from_binary(raw)
+            except Exception as exc:
+                last_err = exc
+                round_failed = True
+                break
+
+        if round_failed and round_num < _rounds and session_factory is not None:
+            log(f"Round {round_num}/{_rounds} failed ({last_err}) — rotating session "
+                f"fingerprint and retrying with a fresh one...", "WARN")
+            try:
+                current_sess = session_factory()
+            except Exception as exc:
+                log_tb("Failed to build rotated session — reusing previous one", exc)
+            time.sleep(3)
             continue
+        elif round_failed:
+            break
 
-        if not raw or len(raw) < 10:
-            raise ValueError(
-                f"NSE returned EMPTY body (HTTP {resp.status_code})\n"
-                f"  URL: {url}\n"
-                f"  This usually means NSE blocked the request or the endpoint changed."
-            )
-
-        # lstrip() handles NSE padding raw HTML with spaces/newlines before <!DOCTYPE
-        raw_stripped = raw.lstrip()
-        if raw_stripped[:1] == b"<" or raw_stripped[:9].lower() == b"<!doctype":
-            preview = raw[:400].decode("utf-8", errors="ignore")
-            raise ValueError(
-                f"NSE returned HTML instead of JSON (HTTP {resp.status_code})\n"
-                f"  URL: {url}\n"
-                f"  Cause: NSE rate-limit / IP block / endpoint moved\n"
-                f"  HTML preview: {preview[:250]}"
-            )
-
-        try:
-            return resp.json()
-        except Exception:
-            pass
-
-        log("Standard JSON decode failed — attempting binary extraction", "WARN")
-        return _extract_json_from_binary(raw)
-
-    raise ValueError(f"NSE {url} failed after {_retry} retries (persistent rate-limit or IP block).")
+    raise ValueError(
+        f"NSE {url} failed after {_rounds} round(s) x {_retry} retries "
+        f"(persistent rate-limit / fingerprint block / IP block).\n  Last error: {last_err}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -395,12 +556,9 @@ def _download_bhavcopy_file(date_str: str, warmed_sess: requests.Session = None)
         # Ensure archive host headers are present
         sess.headers.setdefault("Referer", "https://www.nseindia.com/")
     else:
-        sess = requests.Session()
-        sess.headers.update({
-            "User-Agent":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer":     "https://www.nseindia.com/",
-            "Accept":      "*/*",
-        })
+        sess = nse_session()  # rotated fingerprint, cookie-warmed — far more reliable than a cold requests.Session
+        sess.headers.setdefault("Referer", "https://www.nseindia.com/")
+        sess.headers.setdefault("Accept", "*/*")
     attempt_log = []
 
     for url, is_zip in urls:
@@ -424,7 +582,7 @@ def _download_bhavcopy_file(date_str: str, warmed_sess: requests.Session = None)
                 log(f"HTTP {r.status_code} — IP block or auth: {url[45:]}", "WARN")
             else:
                 log(f"HTTP {r.status_code} — unexpected: {url[45:]}", "WARN")
-        except requests.exceptions.Timeout:
+        except _TIMEOUT_EXCS:
             msg = f"TIMEOUT — {url[45:]}"
             attempt_log.append(msg); log(msg, "WARN")
         except Exception as exc:
@@ -456,7 +614,8 @@ def _download_bhavcopy_api() -> pd.DataFrame:
 
     for idx_url, idx_name in indices:
         try:
-            data = _nse_json(sess, f"https://www.nseindia.com/api/equity-stockIndices?index={idx_url}", referer=referer)
+            data = _nse_json(sess, f"https://www.nseindia.com/api/equity-stockIndices?index={idx_url}",
+                             referer=referer, timeout=30, session_factory=nse_session)
             rows = data.get("data", [])
             if not rows:
                 log(f"{idx_name}: 0 rows returned. API response keys: {list(data.keys())}", "WARN")
@@ -591,7 +750,8 @@ def _first_key(d: dict, keys: list, label: str = ""):
 def fetch_fii_dii():
     sess = nse_session()
     data = _nse_json(sess, "https://www.nseindia.com/api/fiidiiTradeReact",
-                     referer="https://www.nseindia.com/report-detail/eq_fii_dii")
+                     referer="https://www.nseindia.com/report-detail/eq_fii_dii",
+                     timeout=30, session_factory=nse_session)
 
     if isinstance(data, dict):
         rows = data.get("data", []) or [data]
@@ -677,7 +837,7 @@ def fetch_insider(days_back: int = 30):
     data = _nse_json(sess, "https://www.nseindia.com/api/corporates-pit",
                      params={"index":"equities","from_date":from_dt,"to_date":to_dt},
                      referer="https://www.nseindia.com/companies-listing/corporate-filings-pit",
-                     timeout=45)
+                     timeout=45, session_factory=nse_session)
 
     rows = data.get("data",[]) if isinstance(data,dict) else (data or [])
     log(f"Insider API: {len(rows)} raw rows returned")
@@ -842,7 +1002,7 @@ def fetch_filings(days_back: int = 14):
     data = _nse_json(sess, "https://www.nseindia.com/api/corporate-announcements",
                      params={"index":"equities","from_date":from_dt,"to_date":to_dt},
                      referer="https://www.nseindia.com/companies-listing/corporate-filings-announcements",
-                     timeout=45)
+                     timeout=45, session_factory=nse_session)
 
     rows = data.get("data",[]) if isinstance(data,dict) else (data or [])
     log(f"Filings API: {len(rows)} raw rows")
@@ -882,7 +1042,8 @@ def fetch_earnings():
     sess = nse_session()
     data = _nse_json(sess, "https://www.nseindia.com/api/event-calendar",
                      params={"index":"equities"},
-                     referer="https://www.nseindia.com/companies-listing/corporate-filings")
+                     referer="https://www.nseindia.com/companies-listing/corporate-filings",
+                     timeout=30, session_factory=nse_session)
 
     rows = data.get("data",[]) if isinstance(data,dict) else (data or [])
     log(f"Earnings API: {len(rows)} raw rows")
