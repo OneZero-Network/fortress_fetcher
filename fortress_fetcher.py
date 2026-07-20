@@ -12,6 +12,26 @@
 ║    GITHUB_REPOSITORY   — set automatically by GitHub Actions       ║
 ║    GITHUB_RUN_ID       — set automatically by GitHub Actions       ║
 ║                                                                      ║
+║  v2.5 changes vs v2.4 (Akamai-confirmed, scoped Playwright fix):    ║
+║    - CONFIRMED (not inferred): corporates-pit sets bm_sz/bm_sv —    ║
+║      Akamai Bot Manager cookies — on its stub/timeout responses.    ║
+║      corporate-announcements now succeeds under the same WAF, so    ║
+║      only corporates-pit gets the browser-based fix below.          ║
+║    - ADDED: harvest_akamai_cookies() launches a stealth-patched     ║
+║      headless Chromium via Playwright ONCE per run, before the      ║
+║      Insider chunk loop, to let Akamai's sensor JS actually run     ║
+║      and earn legitimate bm_sz/bm_sv/ak_bmsc cookies                ║
+║    - Harvested cookies are injected into the existing curl_cffi     ║
+║      session; the real API call still goes through curl_cffi        ║
+║      (fast) — Playwright is a cookie source, not a scraper          ║
+║    - Every other endpoint (Bhavcopy/FII-DII/Filings/Earnings)       ║
+║      is untouched — curl_cffi-only, since curl_cffi already works   ║
+║      for all of them, including Filings as of the v2.4 fix          ║
+║    - Fully optional dependency: if Playwright/Chromium isn't        ║
+║      installed, or the harvest fails for any reason, this is        ║
+║      logged and the script falls back to the plain curl_cffi        ║
+║      attempt exactly as it worked in v2.4 — never fatal             ║
+║                                                                      ║
 ║  v2.4 changes vs v2.3 (Insider/Filings timeout hybrid fix):        ║
 ║    - Insider + Filings (corporates-pit / corporate-announcements)  ║
 ║      now run FIRST in main(), right after shared warmup, so they   ║
@@ -91,6 +111,23 @@ except ImportError:
     HAS_CURL_CFFI = False
     cf_requests = None
     _CfTimeout = _CfConnectionError = _CfRequestException = ()
+
+# ── Optional: Playwright, used ONLY to harvest Akamai Bot Manager cookies
+# (bm_sz/bm_sv/ak_bmsc) for the one endpoint (corporates-pit) that curl_cffi
+# cannot get past regardless of TLS fingerprint — confirmed by the bm_sz/bm_sv
+# cookies Akamai sets on the stubbed/timed-out responses. A real Chromium runs
+# Akamai's sensor JS and earns legitimate cookies; those get handed to the
+# existing curl_cffi session, which then makes the actual API call as normal.
+# Every other endpoint keeps using curl_cffi only — this is deliberately not
+# a wholesale migration. If Playwright/Chromium isn't installed (or the
+# harvest fails for any reason), the script logs it and falls back to the
+# plain curl_cffi attempt exactly as before — never fatal.
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except ImportError:
+    HAS_PLAYWRIGHT = False
+    sync_playwright = None
 
 # Unified exception tuples so every except-clause below catches failures from
 # EITHER backend (plain requests or curl_cffi), whichever is active.
@@ -399,6 +436,101 @@ def nse_session(timeout: int = 30):
         except Exception as exc:
             log_tb(f"NSE warmup unexpected error for {url}", exc)
     return s
+
+
+# ── Akamai cookie harvester (Playwright) ────────────────────────────────
+# Scoped narrowly to corporates-pit: everything else in this script keeps
+# using curl_cffi only, because everything else works with curl_cffi only.
+_AKAMAI_COOKIE_NAMES = {"bm_sz", "bm_sv", "ak_bmsc", "bm_mi", "_abck"}
+
+def harvest_akamai_cookies(page_url: str, wait_seconds: float = 12.0):
+    """
+    Load `page_url` in a real (stealth-patched) headless Chromium so Akamai
+    Bot Manager's sensor JS actually runs and issues legitimate bm_sz/bm_sv/
+    ak_bmsc cookies, then return those cookies as a dict.
+
+    Returns None (never raises) if Playwright isn't installed or the harvest
+    fails for any reason — callers must treat that as "couldn't get a boost,
+    fall back to the plain curl_cffi attempt", not as a fatal error.
+    """
+    if not HAS_PLAYWRIGHT:
+        log("Playwright not installed — skipping Akamai cookie harvest, "
+            "falling back to curl_cffi-only for this endpoint", "WARN")
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                ],
+            )
+            context = browser.new_context(
+                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                timezone_id="Asia/Kolkata",
+            )
+            # Patch the most common headless tells Akamai's sensor script
+            # checks for. Not bulletproof, but removes the cheapest signals.
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                window.chrome = { runtime: {} };
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (params) => (
+                    params.name === 'notifications'
+                        ? Promise.resolve({ state: Notification.permission })
+                        : originalQuery(params)
+                );
+            """)
+            page = context.new_page()
+            log(f"Playwright: loading {page_url} to earn Akamai cookies...", "DBG")
+            page.goto(page_url, timeout=int(wait_seconds * 1000) + 15000, wait_until="domcontentloaded")
+            # Akamai's sensor payload posts asynchronously after load — give
+            # it real wall-clock time rather than trusting networkidle, which
+            # can fire before the sensor beacon completes.
+            page.wait_for_timeout(int(wait_seconds * 1000))
+
+            cookies = context.cookies()
+            browser.close()
+
+        cookie_dict = {c["name"]: c["value"] for c in cookies}
+        akamai_found = _AKAMAI_COOKIE_NAMES & cookie_dict.keys()
+        if akamai_found:
+            log(f"Playwright harvested {len(akamai_found)} Akamai cookie(s): "
+                f"{sorted(akamai_found)}", "OK")
+        else:
+            log("Playwright completed but no Akamai cookies were set — "
+                "site may not be challenging this session, or the challenge "
+                "didn't fire in time", "WARN")
+        return cookie_dict
+
+    except Exception as exc:
+        log_tb("Playwright Akamai cookie harvest failed — falling back to curl_cffi-only", exc)
+        return None
+
+
+def _inject_cookies_into_session(sess, cookie_dict: dict, domain: str = ".nseindia.com"):
+    """Copy harvested browser cookies into the curl_cffi/requests session that
+    will make the actual API call, so that call rides on a real, JS-verified
+    Akamai session instead of curl_cffi's fingerprint alone."""
+    if not cookie_dict:
+        return 0
+    injected = 0
+    for name, value in cookie_dict.items():
+        try:
+            sess.cookies.set(name, value, domain=domain)
+            injected += 1
+        except Exception as exc:
+            log(f"Could not inject cookie '{name}': {exc}", "WARN")
+    log(f"Injected {injected}/{len(cookie_dict)} harvested cookie(s) into NSE session", "DBG")
+    return injected
 
 
 def _extract_json_from_binary(raw_bytes: bytes):
@@ -961,6 +1093,24 @@ def fetch_insider(days_back: int = 30, max_days_per_request: int = 14, sess=None
 
     log(f"Insider: fetching {full_from.strftime('%d-%m-%Y')} → {full_to.strftime('%d-%m-%Y')} "
         f"in {len(chunks)} chunk(s) of <={max_days_per_request}d (IST: {now_ist.strftime('%Y-%m-%d %H:%M')})")
+
+    # ── Akamai cookie harvest ────────────────────────────────────────
+    # corporates-pit is the one endpoint that curl_cffi alone can't get past
+    # (confirmed: it sets bm_sz/bm_sv — Akamai Bot Manager — then stubs or
+    # hangs the actual call). Do this ONCE per run, before the chunk loop,
+    # not per-chunk: it's a real browser launch (a few seconds), and the
+    # cookies it earns are reusable across all chunks on this session.
+    # Never fatal — if Playwright isn't installed or the harvest fails, this
+    # just logs and falls through to the plain curl_cffi attempt below,
+    # exactly as it worked before this was added.
+    try:
+        harvested = harvest_akamai_cookies(
+            "https://www.nseindia.com/companies-listing/corporate-filings-pit"
+        )
+        if harvested:
+            _inject_cookies_into_session(sess, harvested)
+    except Exception as exc:
+        log_tb("Akamai cookie harvest step raised unexpectedly — continuing without it", exc)
 
     rows: list = []
     seen_keys: set = set()
