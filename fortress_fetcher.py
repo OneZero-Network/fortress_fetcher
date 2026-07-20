@@ -12,6 +12,23 @@
 ║    GITHUB_REPOSITORY   — set automatically by GitHub Actions       ║
 ║    GITHUB_RUN_ID       — set automatically by GitHub Actions       ║
 ║                                                                      ║
+║  v2.6 changes vs v2.5 (HTTP/2 retry + extend harvester to Filings): ║
+║    - BUGFIX: Playwright's Chromium hit an instant (~100ms)          ║
+║      net::ERR_HTTP2_PROTOCOL_ERROR loading the corporates-pit       ║
+║      section page — a connection reset, not a timeout. Harvester    ║
+║      now retries once with --disable-http2 (forces HTTP/1.1) if     ║
+║      the first attempt fails with an HTTP2/QUIC-level error         ║
+║    - Filings (corporate-announcements) failed this run despite      ║
+║      succeeding the last two runs — same Akamai product, run        ║
+║      happened at 09:51 IST (market open) vs the usual post-close    ║
+║      ~19:00 IST slot, so it now gets the same optional cookie       ║
+║      harvest fetch_insider already had, for the same reason         ║
+║    - NOTE (not yet actionable): this run was off the 13:30 UTC      ║
+║      cron schedule — worth checking whether it was a manual         ║
+║      workflow_dispatch, since market-hours load may be tightening   ║
+║      Akamai's posture on both endpoints independent of anything     ║
+║      this script does                                               ║
+║                                                                      ║
 ║  v2.5 changes vs v2.4 (Akamai-confirmed, scoped Playwright fix):    ║
 ║    - CONFIRMED (not inferred): corporates-pit sets bm_sz/bm_sv —    ║
 ║      Akamai Bot Manager cookies — on its stub/timeout responses.    ║
@@ -443,6 +460,63 @@ def nse_session(timeout: int = 30):
 # using curl_cffi only, because everything else works with curl_cffi only.
 _AKAMAI_COOKIE_NAMES = {"bm_sz", "bm_sv", "ak_bmsc", "bm_mi", "_abck"}
 
+def _harvest_akamai_cookies_once(page_url: str, wait_seconds: float, disable_http2: bool = False):
+    """Single attempt. Raises on failure — the caller (harvest_akamai_cookies)
+    decides whether to retry or give up."""
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+        "--no-sandbox",
+    ]
+    if disable_http2:
+        # Seen in the wild: Chromium's HTTP/2 handshake to nseindia.com gets
+        # reset instantly (net::ERR_HTTP2_PROTOCOL_ERROR) — happens in ~100ms,
+        # far too fast to be a real negotiation failure, which looks like
+        # Akamai (or an intermediate) actively resetting HTTP/2 connections
+        # for this client pattern specifically. Falling back to HTTP/1.1
+        # sidesteps that without touching anything else.
+        launch_args.append("--disable-http2")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=launch_args)
+        context = browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+            viewport={"width": 1920, "height": 1080},
+            locale="en-US",
+            timezone_id="Asia/Kolkata",
+        )
+        # Patch the most common headless tells Akamai's sensor script
+        # checks for. Not bulletproof, but removes the cheapest signals.
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            window.chrome = { runtime: {} };
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (params) => (
+                params.name === 'notifications'
+                    ? Promise.resolve({ state: Notification.permission })
+                    : originalQuery(params)
+            );
+        """)
+        page = context.new_page()
+        log(f"Playwright: loading {page_url} to earn Akamai cookies"
+            f"{' (HTTP/1.1 fallback)' if disable_http2 else ''}...", "DBG")
+        page.goto(page_url, timeout=int(wait_seconds * 1000) + 15000, wait_until="domcontentloaded")
+        # Akamai's sensor payload posts asynchronously after load — give
+        # it real wall-clock time rather than trusting networkidle, which
+        # can fire before the sensor beacon completes.
+        page.wait_for_timeout(int(wait_seconds * 1000))
+
+        cookies = context.cookies()
+        browser.close()
+
+    return {c["name"]: c["value"] for c in cookies}
+
+
+_HTTP2_ERROR_MARKERS = ("ERR_HTTP2_PROTOCOL_ERROR", "ERR_HTTP2", "ERR_QUIC_PROTOCOL_ERROR")
+
 def harvest_akamai_cookies(page_url: str, wait_seconds: float = 12.0):
     """
     Load `page_url` in a real (stealth-patched) headless Chromium so Akamai
@@ -458,62 +532,36 @@ def harvest_akamai_cookies(page_url: str, wait_seconds: float = 12.0):
             "falling back to curl_cffi-only for this endpoint", "WARN")
         return None
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                ],
-            )
-            context = browser.new_context(
-                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
-                viewport={"width": 1920, "height": 1080},
-                locale="en-US",
-                timezone_id="Asia/Kolkata",
-            )
-            # Patch the most common headless tells Akamai's sensor script
-            # checks for. Not bulletproof, but removes the cheapest signals.
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                window.chrome = { runtime: {} };
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (params) => (
-                    params.name === 'notifications'
-                        ? Promise.resolve({ state: Notification.permission })
-                        : originalQuery(params)
-                );
-            """)
-            page = context.new_page()
-            log(f"Playwright: loading {page_url} to earn Akamai cookies...", "DBG")
-            page.goto(page_url, timeout=int(wait_seconds * 1000) + 15000, wait_until="domcontentloaded")
-            # Akamai's sensor payload posts asynchronously after load — give
-            # it real wall-clock time rather than trusting networkidle, which
-            # can fire before the sensor beacon completes.
-            page.wait_for_timeout(int(wait_seconds * 1000))
+    cookie_dict = None
+    last_exc = None
+    for disable_http2 in (False, True):
+        try:
+            cookie_dict = _harvest_akamai_cookies_once(page_url, wait_seconds, disable_http2=disable_http2)
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            is_http2_err = any(m in str(exc) for m in _HTTP2_ERROR_MARKERS)
+            if disable_http2 or not is_http2_err:
+                # Either we already tried the HTTP/1.1 fallback, or this
+                # wasn't an HTTP/2-level error to begin with — no point retrying.
+                break
+            log(f"Playwright hit an HTTP/2-level error on first attempt "
+                f"({exc.__class__.__name__}) — retrying once with HTTP/2 disabled", "WARN")
 
-            cookies = context.cookies()
-            browser.close()
-
-        cookie_dict = {c["name"]: c["value"] for c in cookies}
-        akamai_found = _AKAMAI_COOKIE_NAMES & cookie_dict.keys()
-        if akamai_found:
-            log(f"Playwright harvested {len(akamai_found)} Akamai cookie(s): "
-                f"{sorted(akamai_found)}", "OK")
-        else:
-            log("Playwright completed but no Akamai cookies were set — "
-                "site may not be challenging this session, or the challenge "
-                "didn't fire in time", "WARN")
-        return cookie_dict
-
-    except Exception as exc:
-        log_tb("Playwright Akamai cookie harvest failed — falling back to curl_cffi-only", exc)
+    if last_exc is not None:
+        log_tb("Playwright Akamai cookie harvest failed — falling back to curl_cffi-only", last_exc)
         return None
+
+    akamai_found = _AKAMAI_COOKIE_NAMES & cookie_dict.keys()
+    if akamai_found:
+        log(f"Playwright harvested {len(akamai_found)} Akamai cookie(s): "
+            f"{sorted(akamai_found)}", "OK")
+    else:
+        log("Playwright completed but no Akamai cookies were set — "
+            "site may not be challenging this session, or the challenge "
+            "didn't fire in time", "WARN")
+    return cookie_dict
 
 
 def _inject_cookies_into_session(sess, cookie_dict: dict, domain: str = ".nseindia.com"):
@@ -1321,6 +1369,21 @@ def fetch_filings(days_back: int = 14, sess=None):
     from_dt = (now_ist - timedelta(days=days_back)).strftime("%d-%m-%Y")
     to_dt   = now_ist.strftime("%d-%m-%Y")
     log(f"Filings: fetching {from_dt} → {to_dt}")
+
+    # Same harvester used for Insider — corporate-announcements sits behind
+    # the same Akamai product (confirmed by bm_sz/bm_sv on its own warmup
+    # response) and failed under load this run despite succeeding on the
+    # last two runs, so it gets the same optional boost. Never fatal: falls
+    # straight through to curl_cffi-only if Playwright is unavailable or the
+    # harvest fails.
+    try:
+        harvested = harvest_akamai_cookies(
+            "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
+        )
+        if harvested:
+            _inject_cookies_into_session(sess, harvested)
+    except Exception as exc:
+        log_tb("Akamai cookie harvest step raised unexpectedly — continuing without it", exc)
 
     data = _nse_json(sess, "https://www.nseindia.com/api/corporate-announcements",
                      params={"index":"equities","from_date":from_dt,"to_date":to_dt},
