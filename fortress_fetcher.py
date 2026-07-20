@@ -12,61 +12,6 @@
 ║    GITHUB_REPOSITORY   — set automatically by GitHub Actions       ║
 ║    GITHUB_RUN_ID       — set automatically by GitHub Actions       ║
 ║                                                                      ║
-║  v2.6 changes vs v2.5 (HTTP/2 retry + extend harvester to Filings): ║
-║    - BUGFIX: Playwright's Chromium hit an instant (~100ms)          ║
-║      net::ERR_HTTP2_PROTOCOL_ERROR loading the corporates-pit       ║
-║      section page — a connection reset, not a timeout. Harvester    ║
-║      now retries once with --disable-http2 (forces HTTP/1.1) if     ║
-║      the first attempt fails with an HTTP2/QUIC-level error         ║
-║    - Filings (corporate-announcements) failed this run despite      ║
-║      succeeding the last two runs — same Akamai product, run        ║
-║      happened at 09:51 IST (market open) vs the usual post-close    ║
-║      ~19:00 IST slot, so it now gets the same optional cookie       ║
-║      harvest fetch_insider already had, for the same reason         ║
-║    - NOTE (not yet actionable): this run was off the 13:30 UTC      ║
-║      cron schedule — worth checking whether it was a manual         ║
-║      workflow_dispatch, since market-hours load may be tightening   ║
-║      Akamai's posture on both endpoints independent of anything     ║
-║      this script does                                               ║
-║                                                                      ║
-║  v2.5 changes vs v2.4 (Akamai-confirmed, scoped Playwright fix):    ║
-║    - CONFIRMED (not inferred): corporates-pit sets bm_sz/bm_sv —    ║
-║      Akamai Bot Manager cookies — on its stub/timeout responses.    ║
-║      corporate-announcements now succeeds under the same WAF, so    ║
-║      only corporates-pit gets the browser-based fix below.          ║
-║    - ADDED: harvest_akamai_cookies() launches a stealth-patched     ║
-║      headless Chromium via Playwright ONCE per run, before the      ║
-║      Insider chunk loop, to let Akamai's sensor JS actually run     ║
-║      and earn legitimate bm_sz/bm_sv/ak_bmsc cookies                ║
-║    - Harvested cookies are injected into the existing curl_cffi     ║
-║      session; the real API call still goes through curl_cffi        ║
-║      (fast) — Playwright is a cookie source, not a scraper          ║
-║    - Every other endpoint (Bhavcopy/FII-DII/Filings/Earnings)       ║
-║      is untouched — curl_cffi-only, since curl_cffi already works   ║
-║      for all of them, including Filings as of the v2.4 fix          ║
-║    - Fully optional dependency: if Playwright/Chromium isn't        ║
-║      installed, or the harvest fails for any reason, this is        ║
-║      logged and the script falls back to the plain curl_cffi        ║
-║      attempt exactly as it worked in v2.4 — never fatal             ║
-║                                                                      ║
-║  v2.4 changes vs v2.3 (Insider/Filings timeout hybrid fix):        ║
-║    - Insider + Filings (corporates-pit / corporate-announcements)  ║
-║      now run FIRST in main(), right after shared warmup, so they   ║
-║      get the freshest session and least prior traffic in the run  ║
-║    - Added per-path throttle (6s) for these two endpoints only,    ║
-║      independent of the global 2.5s gap — full-duration hangs      ║
-║      that clear on retry look like a path-specific tarpit, not a   ║
-║      client-fingerprint block                                      ║
-║    - Added section-page warmup (the actual companies-listing page ║
-║      a browser would visit) before calling these two endpoints,    ║
-║      not just the generic homepage/market-data warmup              ║
-║    - Every NSE response now logs diagnostic headers (Server,       ║
-║      cf-ray, X-RateLimit-*, Retry-After, Set-Cookie, etc.) so a    ║
-║      future timeout/stub carries evidence of what's actually       ║
-║      fronting the endpoint, instead of just a guess                ║
-║    - BUGFIX: fetch_filings used UTC datetime.today() instead of    ║
-║      IST — same class of bug already fixed in fetch_insider         ║
-║                                                                      ║
 ║  v2.3 changes vs v2.2:                                             ║
 ║    - BUGFIX: sell filter was "sell" only — "market sale", "sale"   ║
 ║      slipped through. Now SKIP_TYPES whitelist-rejects any type    ║
@@ -128,23 +73,6 @@ except ImportError:
     HAS_CURL_CFFI = False
     cf_requests = None
     _CfTimeout = _CfConnectionError = _CfRequestException = ()
-
-# ── Optional: Playwright, used ONLY to harvest Akamai Bot Manager cookies
-# (bm_sz/bm_sv/ak_bmsc) for the one endpoint (corporates-pit) that curl_cffi
-# cannot get past regardless of TLS fingerprint — confirmed by the bm_sz/bm_sv
-# cookies Akamai sets on the stubbed/timed-out responses. A real Chromium runs
-# Akamai's sensor JS and earns legitimate cookies; those get handed to the
-# existing curl_cffi session, which then makes the actual API call as normal.
-# Every other endpoint keeps using curl_cffi only — this is deliberately not
-# a wholesale migration. If Playwright/Chromium isn't installed (or the
-# harvest fails for any reason), the script logs it and falls back to the
-# plain curl_cffi attempt exactly as before — never fatal.
-try:
-    from playwright.sync_api import sync_playwright
-    HAS_PLAYWRIGHT = True
-except ImportError:
-    HAS_PLAYWRIGHT = False
-    sync_playwright = None
 
 # Unified exception tuples so every except-clause below catches failures from
 # EITHER backend (plain requests or curl_cffi), whichever is active.
@@ -213,56 +141,12 @@ def _next_fingerprint():
 _MIN_REQUEST_GAP_SEC = 2.5
 _last_request_ts = {"t": 0.0}
 
-# ── Per-path throttle ─────────────────────────────────────────────────
-# corporates-pit and corporate-announcements consistently hang for the
-# FULL timeout duration (not a fast 403/redirect) while every other NSE
-# endpoint hit in the same run, same session, responds fast. A fast
-# JS-challenge/bot-check normally answers quickly (small HTML/JS payload
-# or an instant 403) — it doesn't sit on the connection. A slow/silent
-# hang that clears on a *different* attempt is the signature of a
-# path-specific rate-limiter/tarpit sitting in front of just these two
-# endpoints. So in addition to the global gap above, these paths get
-# their own longer minimum spacing, independent of what else the script
-# has been doing.
-_PATH_THROTTLE_GAP_SEC = {
-    "/api/corporates-pit": 6.0,
-    "/api/corporate-announcements": 6.0,
-}
-_last_path_request_ts: dict = {}
-
-def _throttle(path_key: str = None):
+def _throttle():
     now = time.time()
     wait = _last_request_ts["t"] + _MIN_REQUEST_GAP_SEC - now
-    if path_key and path_key in _PATH_THROTTLE_GAP_SEC:
-        gap = _PATH_THROTTLE_GAP_SEC[path_key]
-        last = _last_path_request_ts.get(path_key, 0.0)
-        path_wait = last + gap - now
-        wait = max(wait, path_wait)
     if wait > 0:
         time.sleep(wait)
-    now2 = time.time()
-    _last_request_ts["t"] = now2
-    if path_key:
-        _last_path_request_ts[path_key] = now2
-
-
-def _diag_headers(resp) -> str:
-    """Pull out the headers that would reveal a WAF/bot-management product
-    fronting this endpoint (Akamai, Cloudflare, custom rate-limiter, etc.),
-    so a timeout/small-payload log line carries actual diagnostic evidence
-    instead of just a guess. Logged at DBG level on every response."""
-    try:
-        h = resp.headers
-    except Exception:
-        return "(no headers available)"
-    interesting = [
-        "Server", "Via", "X-Cache", "X-Akamai-Transformed", "X-Akamai-Request-ID",
-        "cf-ray", "cf-cache-status", "X-RateLimit-Limit", "X-RateLimit-Remaining",
-        "X-RateLimit-Reset", "Retry-After", "X-Request-ID", "X-Frame-Options",
-    ]
-    found = {k: h[k] for k in interesting if k in h}
-    cookies = list(getattr(resp, "cookies", {}) or {})
-    return f"headers={found or '(none of interest)'} cookies_set={cookies}"
+    _last_request_ts["t"] = time.time()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -455,132 +339,6 @@ def nse_session(timeout: int = 30):
     return s
 
 
-# ── Akamai cookie harvester (Playwright) ────────────────────────────────
-# Scoped narrowly to corporates-pit: everything else in this script keeps
-# using curl_cffi only, because everything else works with curl_cffi only.
-_AKAMAI_COOKIE_NAMES = {"bm_sz", "bm_sv", "ak_bmsc", "bm_mi", "_abck"}
-
-def _harvest_akamai_cookies_once(page_url: str, wait_seconds: float, disable_http2: bool = False):
-    """Single attempt. Raises on failure — the caller (harvest_akamai_cookies)
-    decides whether to retry or give up."""
-    launch_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-dev-shm-usage",
-        "--no-sandbox",
-    ]
-    if disable_http2:
-        # Seen in the wild: Chromium's HTTP/2 handshake to nseindia.com gets
-        # reset instantly (net::ERR_HTTP2_PROTOCOL_ERROR) — happens in ~100ms,
-        # far too fast to be a real negotiation failure, which looks like
-        # Akamai (or an intermediate) actively resetting HTTP/2 connections
-        # for this client pattern specifically. Falling back to HTTP/1.1
-        # sidesteps that without touching anything else.
-        launch_args.append("--disable-http2")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=launch_args)
-        context = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
-            viewport={"width": 1920, "height": 1080},
-            locale="en-US",
-            timezone_id="Asia/Kolkata",
-        )
-        # Patch the most common headless tells Akamai's sensor script
-        # checks for. Not bulletproof, but removes the cheapest signals.
-        context.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-            window.chrome = { runtime: {} };
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (params) => (
-                params.name === 'notifications'
-                    ? Promise.resolve({ state: Notification.permission })
-                    : originalQuery(params)
-            );
-        """)
-        page = context.new_page()
-        log(f"Playwright: loading {page_url} to earn Akamai cookies"
-            f"{' (HTTP/1.1 fallback)' if disable_http2 else ''}...", "DBG")
-        page.goto(page_url, timeout=int(wait_seconds * 1000) + 15000, wait_until="domcontentloaded")
-        # Akamai's sensor payload posts asynchronously after load — give
-        # it real wall-clock time rather than trusting networkidle, which
-        # can fire before the sensor beacon completes.
-        page.wait_for_timeout(int(wait_seconds * 1000))
-
-        cookies = context.cookies()
-        browser.close()
-
-    return {c["name"]: c["value"] for c in cookies}
-
-
-_HTTP2_ERROR_MARKERS = ("ERR_HTTP2_PROTOCOL_ERROR", "ERR_HTTP2", "ERR_QUIC_PROTOCOL_ERROR")
-
-def harvest_akamai_cookies(page_url: str, wait_seconds: float = 12.0):
-    """
-    Load `page_url` in a real (stealth-patched) headless Chromium so Akamai
-    Bot Manager's sensor JS actually runs and issues legitimate bm_sz/bm_sv/
-    ak_bmsc cookies, then return those cookies as a dict.
-
-    Returns None (never raises) if Playwright isn't installed or the harvest
-    fails for any reason — callers must treat that as "couldn't get a boost,
-    fall back to the plain curl_cffi attempt", not as a fatal error.
-    """
-    if not HAS_PLAYWRIGHT:
-        log("Playwright not installed — skipping Akamai cookie harvest, "
-            "falling back to curl_cffi-only for this endpoint", "WARN")
-        return None
-
-    cookie_dict = None
-    last_exc = None
-    for disable_http2 in (False, True):
-        try:
-            cookie_dict = _harvest_akamai_cookies_once(page_url, wait_seconds, disable_http2=disable_http2)
-            last_exc = None
-            break
-        except Exception as exc:
-            last_exc = exc
-            is_http2_err = any(m in str(exc) for m in _HTTP2_ERROR_MARKERS)
-            if disable_http2 or not is_http2_err:
-                # Either we already tried the HTTP/1.1 fallback, or this
-                # wasn't an HTTP/2-level error to begin with — no point retrying.
-                break
-            log(f"Playwright hit an HTTP/2-level error on first attempt "
-                f"({exc.__class__.__name__}) — retrying once with HTTP/2 disabled", "WARN")
-
-    if last_exc is not None:
-        log_tb("Playwright Akamai cookie harvest failed — falling back to curl_cffi-only", last_exc)
-        return None
-
-    akamai_found = _AKAMAI_COOKIE_NAMES & cookie_dict.keys()
-    if akamai_found:
-        log(f"Playwright harvested {len(akamai_found)} Akamai cookie(s): "
-            f"{sorted(akamai_found)}", "OK")
-    else:
-        log("Playwright completed but no Akamai cookies were set — "
-            "site may not be challenging this session, or the challenge "
-            "didn't fire in time", "WARN")
-    return cookie_dict
-
-
-def _inject_cookies_into_session(sess, cookie_dict: dict, domain: str = ".nseindia.com"):
-    """Copy harvested browser cookies into the curl_cffi/requests session that
-    will make the actual API call, so that call rides on a real, JS-verified
-    Akamai session instead of curl_cffi's fingerprint alone."""
-    if not cookie_dict:
-        return 0
-    injected = 0
-    for name, value in cookie_dict.items():
-        try:
-            sess.cookies.set(name, value, domain=domain)
-            injected += 1
-        except Exception as exc:
-            log(f"Could not inject cookie '{name}': {exc}", "WARN")
-    log(f"Injected {injected}/{len(cookie_dict)} harvested cookie(s) into NSE session", "DBG")
-    return injected
-
-
 def _extract_json_from_binary(raw_bytes: bytes):
     """Last-resort JSON extraction from mangled/compressed responses."""
     for enc in ("utf-8", "utf-8-sig", "latin-1", "cp1252"):
@@ -613,8 +371,7 @@ def _extract_json_from_binary(raw_bytes: bytes):
 
 
 def _nse_json(sess, url: str, params=None, timeout: int = 25, referer: str = None,
-              _retry: int = 2, min_bytes: int = 0, session_factory=None, _rounds: int = 2,
-              path_key: str = None, section_warmup: str = None):
+              _retry: int = 2, min_bytes: int = 0, session_factory=None, _rounds: int = 2):
     """
     GET a NSE endpoint and return parsed JSON.
     Raises ValueError with FULL context on any failure.
@@ -634,18 +391,6 @@ def _nse_json(sess, url: str, params=None, timeout: int = 25, referer: str = Non
     blocked" even if it's technically valid JSON (e.g. NSE sometimes returns a
     trivial `{}`/`[]`/error stub under bot detection instead of a real 403).
     Leave at 0 for endpoints where a small-but-real response is normal.
-
-    `path_key`: identifies the URL path for per-path throttling (see
-    _PATH_THROTTLE_GAP_SEC). Auto-derived from `url` if not given.
-
-    `section_warmup`: an optional NSE *section page* URL (e.g. the actual
-    companies-listing page a browser would visit before calling this API)
-    to hit once at the start of each round, on the current session, before
-    the real API call. The existing session warmup only visits the
-    homepage + the market-data page — never the section page the referer
-    header claims to come from — so this fills that gap cheaply for the
-    endpoints where it matters, in case NSE ties a cookie to having
-    actually visited that section.
     """
     req_headers = {}
     if referer:
@@ -655,28 +400,15 @@ def _nse_json(sess, url: str, params=None, timeout: int = 25, referer: str = Non
     short_url = url.replace('https://www.nseindia.com', '').replace('https://nsearchives.nseindia.com', '[arch]')[:80]
     log(f"NSE GET {short_url}", "DBG")
 
-    if path_key is None:
-        path_key = short_url.split("?")[0]
-
     current_sess = sess
     last_err: Exception = ValueError(f"NSE {url}: no attempts were made")
 
     for round_num in range(1, _rounds + 1):
         round_failed = False
 
-        if section_warmup:
-            try:
-                _throttle(path_key)
-                wr = current_sess.get(section_warmup, timeout=timeout)
-                log(f"NSE section warmup {section_warmup[-45:]} → HTTP {wr.status_code} "
-                    f"({len(wr.content)}B) | {_diag_headers(wr)}", "DBG")
-                time.sleep(1.0)
-            except Exception as exc:
-                log(f"NSE section warmup failed for {section_warmup}: {exc} — continuing anyway", "WARN")
-
         for attempt in range(1, _retry + 1):
             try:
-                _throttle(path_key)
+                _throttle()
                 resp = current_sess.get(url, params=params, timeout=timeout, headers=req_headers)
             except _TIMEOUT_EXCS:
                 if attempt < _retry:
@@ -703,7 +435,7 @@ def _nse_json(sess, url: str, params=None, timeout: int = 25, referer: str = Non
 
             raw = resp.content
             log(f"NSE response: HTTP {resp.status_code}, {len(raw)} bytes "
-                f"(round {round_num}/{_rounds}, attempt {attempt}/{_retry}) | {_diag_headers(resp)}", "DBG")
+                f"(round {round_num}/{_rounds}, attempt {attempt}/{_retry})", "DBG")
 
             if resp.status_code in (429, 502, 503) and attempt < _retry:
                 wait = 6 * attempt
@@ -1142,24 +874,6 @@ def fetch_insider(days_back: int = 30, max_days_per_request: int = 14, sess=None
     log(f"Insider: fetching {full_from.strftime('%d-%m-%Y')} → {full_to.strftime('%d-%m-%Y')} "
         f"in {len(chunks)} chunk(s) of <={max_days_per_request}d (IST: {now_ist.strftime('%Y-%m-%d %H:%M')})")
 
-    # ── Akamai cookie harvest ────────────────────────────────────────
-    # corporates-pit is the one endpoint that curl_cffi alone can't get past
-    # (confirmed: it sets bm_sz/bm_sv — Akamai Bot Manager — then stubs or
-    # hangs the actual call). Do this ONCE per run, before the chunk loop,
-    # not per-chunk: it's a real browser launch (a few seconds), and the
-    # cookies it earns are reusable across all chunks on this session.
-    # Never fatal — if Playwright isn't installed or the harvest fails, this
-    # just logs and falls through to the plain curl_cffi attempt below,
-    # exactly as it worked before this was added.
-    try:
-        harvested = harvest_akamai_cookies(
-            "https://www.nseindia.com/companies-listing/corporate-filings-pit"
-        )
-        if harvested:
-            _inject_cookies_into_session(sess, harvested)
-    except Exception as exc:
-        log_tb("Akamai cookie harvest step raised unexpectedly — continuing without it", exc)
-
     rows: list = []
     seen_keys: set = set()
     chunk_failures = []
@@ -1172,9 +886,7 @@ def fetch_insider(days_back: int = 30, max_days_per_request: int = 14, sess=None
             data = _nse_json(sess, "https://www.nseindia.com/api/corporates-pit",
                              params={"index":"equities","from_date":from_dt,"to_date":to_dt},
                              referer="https://www.nseindia.com/companies-listing/corporate-filings-pit",
-                             section_warmup="https://www.nseindia.com/companies-listing/corporate-filings-pit",
-                             timeout=25, min_bytes=20, session_factory=nse_session,
-                             path_key="/api/corporates-pit")
+                             timeout=25, min_bytes=20, session_factory=nse_session)
         except Exception as exc:
             log_tb(f"Insider chunk {i}/{len(chunks)} ({from_dt} → {to_dt}) failed", exc)
             chunk_failures.append(f"{from_dt}→{to_dt}: {exc}")
@@ -1363,34 +1075,14 @@ def fetch_insider(days_back: int = 30, max_days_per_request: int = 14, sess=None
 
 def fetch_filings(days_back: int = 14, sess=None):
     sess = sess or nse_session()
-    # IST, not UTC — GitHub Actions runners are UTC and datetime.today() would
-    # give the wrong calendar date near midnight IST (see fetch_insider).
-    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    from_dt = (now_ist - timedelta(days=days_back)).strftime("%d-%m-%Y")
-    to_dt   = now_ist.strftime("%d-%m-%Y")
+    from_dt = (datetime.today() - timedelta(days=days_back)).strftime("%d-%m-%Y")
+    to_dt   = datetime.today().strftime("%d-%m-%Y")
     log(f"Filings: fetching {from_dt} → {to_dt}")
-
-    # Same harvester used for Insider — corporate-announcements sits behind
-    # the same Akamai product (confirmed by bm_sz/bm_sv on its own warmup
-    # response) and failed under load this run despite succeeding on the
-    # last two runs, so it gets the same optional boost. Never fatal: falls
-    # straight through to curl_cffi-only if Playwright is unavailable or the
-    # harvest fails.
-    try:
-        harvested = harvest_akamai_cookies(
-            "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
-        )
-        if harvested:
-            _inject_cookies_into_session(sess, harvested)
-    except Exception as exc:
-        log_tb("Akamai cookie harvest step raised unexpectedly — continuing without it", exc)
 
     data = _nse_json(sess, "https://www.nseindia.com/api/corporate-announcements",
                      params={"index":"equities","from_date":from_dt,"to_date":to_dt},
                      referer="https://www.nseindia.com/companies-listing/corporate-filings-announcements",
-                     section_warmup="https://www.nseindia.com/companies-listing/corporate-filings-announcements",
-                     timeout=25, session_factory=nse_session,
-                     path_key="/api/corporate-announcements")
+                     timeout=25, session_factory=nse_session)
 
     rows = data.get("data",[]) if isinstance(data,dict) else (data or [])
     log(f"Filings API: {len(rows)} raw rows")
@@ -1573,41 +1265,9 @@ def main():
     log("\n🔧 Warming shared NSE session for this run...")
     shared_sess = nse_session()
 
-    # ── Ordering note ──────────────────────────────────────────────────
-    # Insider and Filings hit corporates-pit / corporate-announcements —
-    # the two endpoints that actually time out. They now run FIRST, right
-    # after the shared warmup, so they get the freshest session and the
-    # least prior NSE traffic in this run, before Bhavcopy/FII-DII/Earnings
-    # (which have never failed) spend any of the run's request budget or
-    # trip any volume-based throttling ahead of them.
-
-    # ── 1. INSIDER ───────────────────────────────────────────────────
+    # ── 1. BHAVCOPY ──────────────────────────────────────────────────
     log("\n" + "─" * 45)
-    log("📥 [1/5] Insider trades")
-    try:
-        df, count = fetch_insider(sess=shared_sess)
-        rows = push_df(client, SHEET_INSIDER, df)
-        log(f"{count} transactions → '{SHEET_INSIDER}'", "OK")
-        results["INSIDER"] = f"✅ {count} buy transactions"
-    except Exception as exc:
-        log_tb("Insider FAILED", exc)
-        results["INSIDER"] = f"⚠️ {type(exc).__name__}: {str(exc)[:150]}"
-
-    # ── 2. FILINGS ───────────────────────────────────────────────────
-    log("\n" + "─" * 45)
-    log("📥 [2/5] Filings")
-    try:
-        df, count = fetch_filings(sess=shared_sess)
-        rows = push_df(client, SHEET_FILINGS, df)
-        log(f"{count} filings → '{SHEET_FILINGS}'", "OK")
-        results["FILINGS"] = f"✅ {count} filings"
-    except Exception as exc:
-        log_tb("Filings FAILED", exc)
-        results["FILINGS"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
-
-    # ── 3. BHAVCOPY ──────────────────────────────────────────────────
-    log("\n" + "─" * 45)
-    log("📥 [3/5] Bhavcopy")
+    log("📥 [1/5] Bhavcopy")
     try:
         df   = fetch_bhavcopy(date_str, sess=shared_sess)
         rows = push_df(client, SHEET_BHAVCOPY, df)
@@ -1617,9 +1277,9 @@ def main():
         log_tb("Bhavcopy FAILED", exc)
         results["BHAVCOPY"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
 
-    # ── 4. FII/DII ───────────────────────────────────────────────────
+    # ── 2. FII/DII ───────────────────────────────────────────────────
     log("\n" + "─" * 45)
-    log("📥 [4/5] FII/DII")
+    log("📥 [2/5] FII/DII")
     try:
         df, fii_cr, dii_cr = fetch_fii_dii(sess=shared_sess)
         rows = push_df(client, SHEET_FII_DII, df)
@@ -1628,6 +1288,30 @@ def main():
     except Exception as exc:
         log_tb("FII/DII FAILED", exc)
         results["FII_DII"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
+
+    # ── 3. INSIDER ───────────────────────────────────────────────────
+    log("\n" + "─" * 45)
+    log("📥 [3/5] Insider trades")
+    try:
+        df, count = fetch_insider(sess=shared_sess)
+        rows = push_df(client, SHEET_INSIDER, df)
+        log(f"{count} transactions → '{SHEET_INSIDER}'", "OK")
+        results["INSIDER"] = f"✅ {count} buy transactions"
+    except Exception as exc:
+        log_tb("Insider FAILED", exc)
+        results["INSIDER"] = f"⚠️ {type(exc).__name__}: {str(exc)[:150]}"
+
+    # ── 4. FILINGS ───────────────────────────────────────────────────
+    log("\n" + "─" * 45)
+    log("📥 [4/5] Filings")
+    try:
+        df, count = fetch_filings(sess=shared_sess)
+        rows = push_df(client, SHEET_FILINGS, df)
+        log(f"{count} filings → '{SHEET_FILINGS}'", "OK")
+        results["FILINGS"] = f"✅ {count} filings"
+    except Exception as exc:
+        log_tb("Filings FAILED", exc)
+        results["FILINGS"] = f"❌ {type(exc).__name__}: {str(exc)[:150]}"
 
     # ── 5. EARNINGS ──────────────────────────────────────────────────
     log("\n" + "─" * 45)
