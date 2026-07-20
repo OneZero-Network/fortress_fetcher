@@ -37,6 +37,16 @@ jobs:
           # in mid-2026. The script falls back to plain requests automatically
           # if this install ever fails, so it's safe even if the wheel breaks.
           pip install curl_cffi || echo "curl_cffi install failed — will fall back to plain requests"
+          # Playwright drives a real Chromium to clear Akamai Bot Manager's JS
+          # challenge on the one endpoint (corporates-pit) that curl_cffi can't
+          # get through no matter the TLS fingerprint. Used ONLY as a cookie
+          # harvester for that single endpoint — everything else still runs on
+          # the much cheaper/faster curl_cffi path. Both steps are non-fatal:
+          # if either fails (wheel breaks, disk quota, etc.) the script detects
+          # Playwright is unavailable and simply skips the harvest, falling
+          # back to the plain curl_cffi attempt exactly as before.
+          pip install playwright || echo "playwright install failed — Insider will fall back to curl_cffi-only"
+          python -m playwright install --with-deps chromium || echo "chromium install failed — Insider will fall back to curl_cffi-only"
 
       - name: Run Fortress Fetcher
         env:
